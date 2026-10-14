@@ -18,17 +18,21 @@ Packages are independent: install one, or all four. The only shared code is `uti
 
 ```sh
 git clone https://github.com/Rohansguliani/rohanMacUtils ~/mactools
-~/mactools/alttab/install.sh        # or snap / spaceswitch / logimouse
+~/mactools/install.sh                  # everything
+~/mactools/install.sh alttab snap      # or just some
 ```
+
+Each package also has its own `<name>/install.sh`, and `install.sh --uninstall [names]`
+removes them again.
 
 Requirements: an Apple Silicon Mac (the ObjC bridge assumes the arm64 calling convention)
 with the Command Line Tools (`xcode-select --install`; that is what makes
 `/usr/bin/python3` real). Developed and tested on macOS 26.x. Nothing else.
 
-`install.sh` writes `~/Library/LaunchAgents/com.mactools.<name>.plist` pointing at the
+`<name>/install.sh` writes `~/Library/LaunchAgents/com.mactools.<name>.plist` pointing at the
 checkout (so `git pull` + re-running `install.sh` is an upgrade), creates
 `~/.config/mactools/<name>.json` with the defaults, and starts the daemon. Logs go to
-`~/Library/Logs/mactools-<name>.log`. `install.sh --uninstall` stops it and removes the
+`~/Library/Logs/mactools-<name>.log`. `<name>/install.sh --uninstall` stops it and removes the
 LaunchAgent.
 
 ### Granting permissions
@@ -64,6 +68,7 @@ half-working.
 ## Layout
 
 ```
+install.sh    install / uninstall any set of packages
 util/         shared code only — nothing here is a daemon
   macbridge.py   ctypes bindings: CoreFoundation / CoreGraphics / HIServices / SkyLight
   objc.py        objc_msgSend bridge + the SkyLight focus SPI (AppKit users only)
