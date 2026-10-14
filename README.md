@@ -1,7 +1,7 @@
 # mactools
 
-Small, dependency-free macOS daemons that replace AltTab, Rectangle, and parts of Logitech
-Options+ with a few hundred lines of Python each. No app bundle, no code signing, no
+Small, dependency-free macOS daemons that replace AltTab, Rectangle, Shottr, and parts of
+Logitech Options+ with a few hundred lines of Python each. No app bundle, no code signing, no
 Homebrew: every package is one script running under Apple's `/usr/bin/python3` through a
 LaunchAgent.
 
@@ -9,10 +9,11 @@ LaunchAgent.
 |---|---|---|---|
 | [`alttab/`](alttab/) | AltTab | Opt+Tab window switcher scoped to the current Space, live thumbnails, frozen MRU order | Accessibility, Screen Recording |
 | [`snap/`](snap/) | Rectangle | Opt+arrows halves, drag-to-edge, companion auto-snap / picker, linked seam resize | Accessibility |
+| [`shot/`](shot/) | Shottr | Opt+1 area → clipboard, Opt+2 area → OCR text, Opt+` area → annotate (arrow, box, pen, text, pixelate) | Accessibility, Screen Recording |
 | [`spaceswitch/`](spaceswitch/) | — | Instant Spaces switching: removes the slide animation from your shortcuts and swipes, instant Mission Control | Accessibility |
 | [`logimouse/`](logimouse/) | Logi Options+ | Logitech MX gesture button and thumb wheel as keystrokes, optional main-wheel inversion — HID++ directly, no Logi software | Input Monitoring, Accessibility |
 
-Packages are independent: install one, or all four. The only shared code is `util/`.
+Packages are independent: install one, or all five. The only shared code is `util/`.
 
 ## Install
 
@@ -76,6 +77,7 @@ util/         shared code only — nothing here is a daemon
   daemon.py      event-tap skeleton: Accessibility wait, tap, health timer, TCC respawn
   windows.py     current-Space window list, MRU, GPU thumbnails, cross-app focus (alttab, snap)
   cards.py       the thumbnail-card HUD (alttab, snap's picker)
+  imaging.py     screen capture, PNG/TIFF, pasteboard, Vision OCR, pixelate, layer flatten (shot)
   install-common.sh
 <name>/       <name>.py, install.sh, README.md
 ```

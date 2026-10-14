@@ -25,7 +25,9 @@ An Opt+Tab window switcher that only shows the windows on the Space you are look
 ```
 
 Hotkeys are strings like `"opt+tab"`, `"ctrl+opt+tab"`; the switcher commits when any
-modifier in the hotkey is released. `switch_app_windows` may be `""` to disable it.
+modifier in the hotkey is released. `switch_app_windows` may be `""` to disable it. (If you
+also run `shot`, which takes Opt+` by default, set this to `"opt+shift+`"` or move one of
+them.)
 
 ## Install
 

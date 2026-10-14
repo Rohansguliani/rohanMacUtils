@@ -5,7 +5,7 @@
 #   ./install.sh --uninstall [names] stop and remove them (configs and logs are kept)
 set -eu
 root=$(cd "$(dirname "$0")" && pwd)
-all="alttab snap spaceswitch logimouse"
+all="alttab snap shot spaceswitch logimouse"
 flag=
 [ "${1:-}" = "--uninstall" ] && { flag=--uninstall; shift; }
 names=${*:-$all}

@@ -50,6 +50,35 @@ def nsstr(s):
     return send(cls("NSString"), "stringWithUTF8String:", vp, (C.c_char_p,), s.encode("utf-8", "replace"))
 
 
+_sig(OBJC, "objc_allocateClassPair", vp, [vp, C.c_char_p, C.c_size_t])
+_sig(OBJC, "objc_registerClassPair", None, [vp])
+_sig(OBJC, "class_addMethod", C.c_bool, [vp, vp, vp, C.c_char_p])
+_IMPS = []  # ctypes thunks must outlive the classes that point at them
+
+
+def define_class(name, superclass, methods):
+    """Create an Objective-C subclass at runtime (an NSView that gets mouseDown:, a window
+    delegate, ...). `methods` maps "selector:" to (restype, argtypes, fn, type_encoding);
+    `fn(self, _cmd, *args)` is a plain Python callable. Returns the Class."""
+    k = OBJC.objc_allocateClassPair(cls(superclass), name.encode(), 0)
+    if not k:
+        return cls(name)  # already registered in this process
+    for selector, (restype, argtypes, fn, enc) in methods.items():
+        imp = C.CFUNCTYPE(restype, vp, vp, *argtypes)(fn)
+        _IMPS.append(imp)
+        OBJC.class_addMethod(k, sel(selector), C.cast(imp, vp), enc.encode())
+    OBJC.objc_registerClassPair(k)
+    _CLASSES[name] = k
+    return k
+
+
+def ns_array(objs):
+    arr = send(cls("NSMutableArray"), "arrayWithCapacity:", vp, (C.c_ulong,), len(objs))
+    for o in objs:
+        send(arr, "addObject:", None, (vp,), o)
+    return arr
+
+
 kCAGravityResizeAspect = vp.in_dll(QUARTZ, "kCAGravityResizeAspect")
 
 

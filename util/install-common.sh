@@ -68,6 +68,11 @@ cat >"$plist" <<EOF
 EOF
 
 launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+# bootout returns before the job is gone; bootstrapping the same label too early fails.
+i=0
+while launchctl print "gui/$uid/$label" >/dev/null 2>&1 && [ $i -lt 50 ]; do
+    sleep 0.1; i=$((i + 1))
+done
 launchctl bootstrap "gui/$uid" "$plist"
 launchctl kickstart -k "gui/$uid/$label"
 echo "$label running from $script"

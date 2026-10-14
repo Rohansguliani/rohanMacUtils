@@ -82,6 +82,7 @@ def load(name, defaults):
         raise ConfigError(f"{path}: {e}") from e
     if not isinstance(user, dict):
         raise ConfigError(f"{path}: top level must be an object")
+    user = {k: v for k, v in user.items() if not k.startswith("_")}  # "_comment" and friends
     unknown = sorted(set(user) - set(defaults))
     if unknown:
         raise ConfigError(f"{path}: unknown keys {unknown}; valid keys: {sorted(defaults)}")

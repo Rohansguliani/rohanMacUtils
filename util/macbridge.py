@@ -78,16 +78,22 @@ _sig(CF, "CFDataCreate", vp, [vp, C.c_char_p, C.c_long])
 _sig(CF, "CFPreferencesCopyAppValue", vp, [vp, vp])
 _sig(CF, "CFMachPortCreateRunLoopSource", vp, [vp, vp, C.c_long])
 _sig(CF, "CFMachPortIsValid", cbool, [vp])
+_sig(CF, "CFMachPortInvalidate", None, [vp])
 _sig(CF, "CFRunLoopGetCurrent", vp, [])
 _sig(CF, "CFRunLoopGetMain", vp, [])
 _sig(CF, "CFRunLoopRun", None, [])
+_sig(CF, "CFRunLoopRunInMode", i32, [vp, f64, cbool])
 _sig(CF, "CFRunLoopWakeUp", None, [vp])
 _sig(CF, "CFRunLoopAddSource", None, [vp, vp, vp])
+_sig(CF, "CFRunLoopRemoveSource", None, [vp, vp, vp])
 _sig(CF, "CFRunLoopAddTimer", None, [vp, vp, vp])
 _sig(CF, "CFAbsoluteTimeGetCurrent", f64, [])
 _sig(CF, "CFUUIDCreateString", vp, [vp, vp])
 TIMER_CB = C.CFUNCTYPE(None, vp, vp)
 _sig(CF, "CFRunLoopTimerCreate", vp, [vp, f64, f64, C.c_ulong, C.c_long, TIMER_CB, vp])
+_sig(CF, "CFRunLoopTimerSetNextFireDate", None, [vp, f64])
+_sig(CF, "CFRunLoopSourceCreate", vp, [vp, C.c_long, vp])
+_sig(CF, "CFRunLoopSourceSignal", None, [vp])
 
 kCFStringEncodingUTF8 = 0x08000100
 kCFNumberSInt32Type = 3
@@ -111,19 +117,37 @@ _sig(CG, "CGEventCreateCopy", vp, [vp])
 _sig(CG, "CGEventCreateData", vp, [vp, vp])
 _sig(CG, "CGEventCreateFromData", vp, [vp, vp])
 _sig(CG, "CGEventCreateKeyboardEvent", vp, [vp, C.c_uint16, cbool])
+_sig(CG, "CGEventCreateMouseEvent", vp, [vp, u32, CGPoint, u32])
 _sig(CG, "CGEventCreateScrollWheelEvent", vp, [vp, u32, u32, i32])
 _sig(CG, "CGEventPost", None, [u32, vp])
+_sig(CG, "CGEventSetType", None, [vp, u32])
+_sig(CG, "CGEventGetType", u32, [vp])
 _sig(CG, "CGEventGetFlags", u64, [vp])
 _sig(CG, "CGEventSetFlags", None, [vp, u64])
 _sig(CG, "CGEventGetLocation", CGPoint, [vp])
 _sig(CG, "CGEventGetTimestamp", u64, [vp])
 _sig(CG, "CGEventGetIntegerValueField", i64, [vp, u32])
+_sig(CG, "CGEventKeyboardGetUnicodeString", None, [vp, C.c_ulong, C.POINTER(C.c_ulong), C.POINTER(C.c_uint16)])
 _sig(CG, "CGEventSetIntegerValueField", None, [vp, u32, i64])
 _sig(CG, "CGEventGetDoubleValueField", f64, [vp, u32])
 _sig(CG, "CGEventSetDoubleValueField", None, [vp, u32, f64])
 _sig(CG, "CGGetDisplaysWithPoint", i32, [CGPoint, u32, C.POINTER(u32), C.POINTER(u32)])
 _sig(CG, "CGDisplayBounds", CGRect, [u32])
 _sig(CG, "CGMainDisplayID", u32, [])
+_sig(CG, "CGGetActiveDisplayList", i32, [u32, C.POINTER(u32), C.POINTER(u32)])
+_sig(CG, "CGDisplayPixelsWide", C.c_size_t, [u32])
+_sig(CG, "CGDisplayPixelsHigh", C.c_size_t, [u32])
+_sig(CG, "CGDisplayHideCursor", i32, [u32])
+_sig(CG, "CGDisplayShowCursor", i32, [u32])
+_sig(CG, "CGPreflightScreenCaptureAccess", cbool, [])
+_sig(CG, "CGRequestScreenCaptureAccess", cbool, [])
+_sig(CG, "CGPathCreateMutable", vp, [])
+_sig(CG, "CGPathCreateWithRect", vp, [CGRect, vp])
+_sig(CG, "CGPathRelease", None, [vp])
+_sig(CG, "CGPathMoveToPoint", None, [vp, vp, f64, f64])
+_sig(CG, "CGPathAddLineToPoint", None, [vp, vp, f64, f64])
+_sig(CG, "CGPathAddRect", None, [vp, vp, CGRect])
+_sig(CG, "CGPathAddRoundedRect", None, [vp, vp, CGRect, f64, f64])
 _sig(CG, "CGWindowListCopyWindowInfo", vp, [u32, u32])
 _sig(CG, "CGImageGetWidth", C.c_size_t, [vp])
 _sig(CS, "CGDisplayCreateUUIDFromDisplayID", vp, [u32])
@@ -134,6 +158,8 @@ kCGHeadInsertEventTap = 0
 kCGEventTapOptionDefault = 0
 kCGEventTapOptionListenOnly = 1
 kCGEventLeftMouseDown, kCGEventLeftMouseUp = 1, 2
+kCGEventRightMouseDown, kCGEventRightMouseUp = 3, 4
+kCGEventMouseMoved = 5
 kCGEventLeftMouseDragged = 6
 kCGEventKeyDown, kCGEventKeyUp, kCGEventFlagsChanged = 10, 11, 12
 kCGEventScrollWheel = 22
@@ -151,6 +177,11 @@ kCGWindowListOptionOnScreenOnly = 1
 kCGWindowListExcludeDesktopElements = 16
 K_WIN_LAYER = vp.in_dll(CG, "kCGWindowLayer").value
 K_WIN_OWNER = vp.in_dll(CG, "kCGWindowOwnerName").value
+K_WIN_OWNER_PID = vp.in_dll(CG, "kCGWindowOwnerPID").value
+K_WIN_BOUNDS = vp.in_dll(CG, "kCGWindowBounds").value
+K_WIN_NUMBER = vp.in_dll(CG, "kCGWindowNumber").value
+K_WIN_ALPHA = vp.in_dll(CG, "kCGWindowAlpha").value
+_sig(CG, "CGRectMakeWithDictionaryRepresentation", cbool, [vp, C.POINTER(CGRect)])
 
 FLAG_SHIFT, FLAG_CTRL, FLAG_OPT, FLAG_CMD = 0x20000, 0x40000, 0x80000, 0x100000
 MODIFIER_MASK = FLAG_SHIFT | FLAG_CTRL | FLAG_OPT | FLAG_CMD
@@ -194,6 +225,7 @@ if SL is not None:
     SLS_NOTIFY_CB = C.CFUNCTYPE(None, u32, vp, C.c_size_t, vp, u32)
     _sig(SL, "SLSRegisterConnectionNotifyProc", i32, [u32, SLS_NOTIFY_CB, u32, vp])
     _sig(SL, "SLSRequestNotificationsForWindows", i32, [u32, C.POINTER(u32), i32])
+    _sig(SL, "SLSSetConnectionProperty", i32, [u32, u32, vp, vp])
     CID = SL.CGSMainConnectionID() if getattr(SL, "CGSMainConnectionID", None) else 0
 else:
     SLS_NOTIFY_CB = None
@@ -227,6 +259,13 @@ def cf_to_i64(ref):
         return 0
     v = i64(0)
     return v.value if CF.CFNumberGetValue(ref, kCFNumberSInt64Type, C.byref(v)) else 0
+
+
+def cf_to_f64(ref):
+    if not ref:
+        return 0.0
+    v = f64(0)
+    return v.value if CF.CFNumberGetValue(ref, 13, C.byref(v)) else 0.0  # 13 = kCFNumberDoubleType
 
 
 def cf_number(n, kind=kCFNumberSInt64Type):
