@@ -122,25 +122,35 @@ def norm_rect(a: CGPoint, b: CGPoint):
 # --- The selection overlay ------------------------------------------------------------
 class Overlay:
     """One borderless panel per capture, covering the display under the cursor. Built
-    once, reused: showing it is a frame grab + setFrame + orderFront."""
+    once, reused: showing it is setContents (the frozen frame) + setFrame + orderFront.
+
+    The frozen frame IS the overlay's content: whatever happens underneath (video, a
+    blinking caret, a notification) stays out of the picture and out of the selection."""
 
     def __init__(self):
         panel = send(send(cls("NSPanel"), "alloc"), "initWithContentRect:styleMask:backing:defer:", vp,
                      (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(100, 100)), NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False)
         send(panel, "setLevel:", None, (i64,), kCGScreenSaverWindowLevel)
         send(panel, "setCollectionBehavior:", None, (u64,), 1 | 16 | 64 | 256)  # all Spaces, stationary, ignores cycle, full-screen aux
-        send(panel, "setOpaque:", None, (cbool,), False)
-        send(panel, "setBackgroundColor:", None, (vp,), send(cls("NSColor"), "clearColor"))
+        send(panel, "setOpaque:", None, (cbool,), True)
+        send(panel, "setBackgroundColor:", None, (vp,), send(cls("NSColor"), "blackColor"))
         send(panel, "setHasShadow:", None, (cbool,), False)
-        send(panel, "setIgnoresMouseEvents:", None, (cbool,), True)  # the event tap drives everything
+        # The panel accepts mouse events so the app underneath stops getting mouseMoved and
+        # cannot reset the cursor; the event tap still sees (and swallows) everything first.
+        send(panel, "setIgnoresMouseEvents:", None, (cbool,), False)
+        send(panel, "setAcceptsMouseMovedEvents:", None, (cbool,), True)
         send(panel, "setAnimationBehavior:", None, (i64,), 2)  # NSWindowAnimationBehaviorNone
         self.panel = panel
         view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(100, 100)))
         send(view, "setWantsLayer:", None, (cbool,), True)
         root = send(view, "layer")
-        send(root, "setBackgroundColor:", None, (vp,), cgcolor(0, 0, 0, 0.0))
+        send(root, "setBackgroundColor:", None, (vp,), cgcolor(0, 0, 0, 1.0))
         send(panel, "setContentView:", None, (vp,), view)
-        # dim = 4 rectangles around the hole so the selection shows true pixels
+        self.frozen = send(cls("CALayer"), "layer")  # the captured display
+        send(self.frozen, "setMagnificationFilter:", None, (vp,), nsstr("nearest"))
+        send(self.frozen, "setMinificationFilter:", None, (vp,), nsstr("nearest"))
+        send(root, "addSublayer:", None, (vp,), self.frozen)
+        # dim = 4 rectangles around the hole so the selection shows the frozen pixels undimmed
         self.dims = []
         for _ in range(4):
             d = send(cls("CALayer"), "layer")
@@ -166,12 +176,15 @@ class Overlay:
         self.frame_tl: Any = None
         self.h = 0.0
 
-    def show(self, frame_tl: CGRect):
+    def show(self, frame_tl: CGRect, frame_img, scale: float):
         self.frame_tl = frame_tl
         self.h = frame_tl.size.h
 
         def build():
             send(self.panel, "setFrame:display:", None, (CGRect, cbool), cocoa_rect(frame_tl), False)
+            send(self.frozen, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), frame_tl.size))
+            send(self.frozen, "setContentsScale:", None, (f64,), scale)
+            send(self.frozen, "setContents:", None, (vp,), frame_img)
             self.set_selection(None)
 
         no_anim(build)
@@ -181,6 +194,7 @@ class Overlay:
     def hide(self):
         if self.shown:
             send(self.panel, "orderOut:", None, (vp,), None)
+            no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))  # drop the 35 MB frame
             self.shown = False
 
     def set_selection(self, sel_tl):
@@ -231,12 +245,12 @@ class Session:
     cur: Any = None
     dragging = False
     refresh_queued = False  # one overlay refresh per main-loop turn, however many drag events arrive
+    t_hotkey = 0.0
 
 
 S = Session()
 _OVERLAY: Any = None
 _EDITOR: Any = None
-_CURSOR_PUSHED = False
 
 
 def clamp_to_frame(pt):
@@ -252,7 +266,10 @@ def queue_refresh():
 
 def _refresh_overlay():
     S.refresh_queued = False
-    if S.active and S.dragging and S.anchor is not None:
+    if not S.active:
+        return
+    set_crosshair()
+    if S.dragging and S.anchor is not None:
         _OVERLAY.set_selection(norm_rect(S.anchor, S.cur))
 
 
@@ -282,13 +299,24 @@ def begin(mode):
 
 
 def _show_overlay():
-    global _CURSOR_PUSHED
     t0 = time.perf_counter()
-    _OVERLAY.show(S.frame_tl)
+    _OVERLAY.show(S.frame_tl, S.frame, S.scale)
     t1 = time.perf_counter()
-    send(send(cls("NSCursor"), "crosshairCursor"), "push")
-    _CURSOR_PUSHED = True
+    set_crosshair()
     trace(f"overlay shown in {(t1 - t0) * 1e3:.1f} ms (+{(time.perf_counter() - t1) * 1e3:.1f} ms cursor), {(time.perf_counter() - S.t_hotkey) * 1e3:.1f} ms after the hotkey")
+
+
+_CROSSHAIR: Any = None
+
+
+def set_crosshair():
+    """NSCursor state is per-app and the frontmost app re-asserts its cursor on every
+    mouseMoved it receives; we are not frontmost. Setting ours after every mouse event
+    (coalesced to the main loop) keeps the crosshair up for the whole selection."""
+    global _CROSSHAIR
+    if _CROSSHAIR is None:
+        _CROSSHAIR = send(cls("NSCursor"), "crosshairCursor")
+    send(_CROSSHAIR, "set")
 
 
 def cancel():
@@ -297,11 +325,8 @@ def cancel():
 
 
 def _teardown():
-    global _CURSOR_PUSHED
     _OVERLAY.hide()
-    if _CURSOR_PUSHED:
-        send(cls("NSCursor"), "pop")
-        _CURSOR_PUSHED = False
+    send(send(cls("NSCursor"), "arrowCursor"), "set")
     if S.frame:
         CG.CGImageRelease(S.frame)
         S.frame = None
@@ -401,6 +426,11 @@ def _drain_main(info):
 # --- Editor -----------------------------------------------------------------------------
 TOOLS = ("arrow", "rect", "pen", "text", "pixelate")
 TOOL_KEYS = {0: "arrow", 15: "rect", 35: "pen", 17: "text", 11: "pixelate"}  # A R P T B
+# toolbar: (id, label, key hint). Buttons are layers; a click is routed by rect in mouse_down.
+TOOLBAR = [("arrow", "↗", "A"), ("rect", "▭", "R"), ("pen", "✎", "P"), ("text", "T", "T"), ("pixelate", "▒", "B"),
+           None, ("undo", "↶", "⌘Z"), ("copy", "Copy", "⌘C"), ("save", "Save", "⌘S")]
+BAR_H = 34.0
+BTN_H, BTN_PAD, BTN_GAP = 24.0, 8.0, 5.0
 
 
 class Editor:
@@ -416,6 +446,10 @@ class Editor:
         self.image = None
         self.sel_tl = CGRect()
         self.scale = 1.0
+        self.canvas_x = 0.0
+        self.bar_min_w = 0.0
+        self.buttons = []
+        self.focused = False
         self.drag_start = None
         self.live = None
         self.pen_path = None
@@ -426,21 +460,63 @@ class Editor:
     def _build(self, w, h):
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
         win = send(send(cls("NSWindow"), "alloc"), "initWithContentRect:styleMask:backing:defer:", vp,
-                   (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(w, h)), style, NSBackingStoreBuffered, False)
-        send(win, "setTitle:", None, (vp,), nsstr("shot - A arrow  R box  P pen  T text  B pixelate  |  Cmd+C copy  Cmd+S save  Cmd+Z undo  Esc close"))
+                   (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(w, h + BAR_H)), style, NSBackingStoreBuffered, False)
+        send(win, "setTitle:", None, (vp,), nsstr("shot"))
         send(win, "setLevel:", None, (i64,), 3)  # floating
         send(win, "setReleasedWhenClosed:", None, (cbool,), False)
         send(win, "setCollectionBehavior:", None, (u64,), 1 | 256)
         send(win, "setAnimationBehavior:", None, (i64,), 2)
-        view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
+        view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h + BAR_H)))
         send(view, "setWantsLayer:", None, (cbool,), True)
         root = send(view, "layer")
+        send(root, "setBackgroundColor:", None, (vp,), cgcolor(0.11, 0.11, 0.12, 1.0))
+        # canvas = image + annotations, sits below the toolbar; flattened together on copy
+        self.canvas = send(cls("CALayer"), "layer")
+        send(self.canvas, "setMasksToBounds:", None, (cbool,), True)
+        send(root, "addSublayer:", None, (vp,), self.canvas)
         self.img_layer = send(cls("CALayer"), "layer")
-        send(root, "addSublayer:", None, (vp,), self.img_layer)
-        self.ann = send(cls("CALayer"), "layer")  # annotations live here; flattened with the image on copy
-        send(root, "addSublayer:", None, (vp,), self.ann)
+        send(self.canvas, "addSublayer:", None, (vp,), self.img_layer)
+        self.ann = send(cls("CALayer"), "layer")
+        send(self.canvas, "addSublayer:", None, (vp,), self.ann)
+        # toolbar strip along the top (Cocoa coords: top = high y)
+        self.bar = send(cls("CALayer"), "layer")
+        send(self.bar, "setBackgroundColor:", None, (vp,), cgcolor(0.16, 0.16, 0.17, 1.0))
+        send(root, "addSublayer:", None, (vp,), self.bar)
+        self.buttons = []  # (id, layer, x0, x1) in bar-local coords
+        x = BTN_PAD
+        for entry in TOOLBAR:
+            if entry is None:
+                x += 14.0
+                continue
+            bid, label, hint = entry
+            text = f"{label} {hint}"
+            bw = 7.4 * len(text) + 14.0
+            b = send(cls("CATextLayer"), "layer")
+            send(b, "setString:", None, (vp,), nsstr(text))
+            send(b, "setFontSize:", None, (f64,), 12.0)
+            send(b, "setFont:", None, (vp,), nsstr("Helvetica"))
+            send(b, "setAlignmentMode:", None, (vp,), nsstr("center"))
+            send(b, "setContentsScale:", None, (f64,), 2.0)
+            send(b, "setCornerRadius:", None, (f64,), 6.0)
+            send(b, "setFrame:", None, (CGRect,), CGRect(CGPoint(x, (BAR_H - BTN_H) / 2 + 4), CGSize(bw, BTN_H - 6)))
+            send(self.bar, "addSublayer:", None, (vp,), b)
+            self.buttons.append((bid, b, x, x + bw))
+            x += bw + BTN_GAP
+        self.bar_min_w = x + BTN_PAD
         send(win, "setContentView:", None, (vp,), view)
         self.win, self.view, self.root = win, view, root
+        self._paint_buttons()
+
+    def _paint_buttons(self):
+        for bid, b, _, _ in self.buttons:
+            on = bid == self.tool
+            send(b, "setBackgroundColor:", None, (vp,), cgcolor(EDIT_COLOR[0], EDIT_COLOR[1], EDIT_COLOR[2], 0.85) if on else cgcolor(1, 1, 1, 0.08))
+            send(b, "setForegroundColor:", None, (vp,), cgcolor(1, 1, 1, 1.0) if on else cgcolor(1, 1, 1, 0.85))
+
+    def set_tool(self, tool):
+        self._end_text()
+        self.tool = tool
+        no_anim(self._paint_buttons)
 
     def open(self, img, sel_tl, scale):
         self.close()
@@ -454,22 +530,37 @@ class Editor:
         self.text_buf = ""
 
         def setup():
+            W = max(w, self.bar_min_w)
+            self.canvas_x = (W - w) / 2.0  # centre a narrow shot under a wider toolbar
+            send(self.canvas, "setFrame:", None, (CGRect,), CGRect(CGPoint(self.canvas_x, 0), CGSize(w, h)))
             send(self.img_layer, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
             send(self.img_layer, "setContents:", None, (vp,), img)
             send(self.img_layer, "setContentsScale:", None, (f64,), scale)
             send(self.ann, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
             for s in list(self._sublayers(self.ann)):
                 send(s, "removeFromSuperlayer")
-            send(self.view, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
-            send(self.win, "setContentSize:", None, (CGSize,), CGSize(w, h))
-            # place it where the selection was, clamped on screen; Cocoa coords
+            send(self.bar, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, h), CGSize(W, BAR_H)))
+            self._paint_buttons()
+            send(self.view, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(W, h + BAR_H)))
+            send(self.win, "setContentSize:", None, (CGSize,), CGSize(W, h + BAR_H))
+            # place it where the selection was (toolbar + title bar above), clamped to the display
             r = cocoa_rect(sel_tl)
-            send(self.win, "setFrameOrigin:", None, (CGPoint,), CGPoint(r.origin.x, r.origin.y - 28))
+            disp = CG.CGDisplayBounds(display_for_point(sel_tl.origin.x, sel_tl.origin.y))
+            dc = cocoa_rect(disp)
+            ox = min(max(r.origin.x - self.canvas_x, dc.origin.x), dc.origin.x + dc.size.w - W)
+            oy = min(max(r.origin.y, dc.origin.y), dc.origin.y + dc.size.h - (h + BAR_H + 28))
+            send(self.win, "setFrameOrigin:", None, (CGPoint,), CGPoint(ox, oy))
 
         no_anim(setup)
+        self._activate()
+        self.open_ = True
+        self.focused = True  # owns the keyboard until a click lands outside the window
+
+    def _activate(self):
+        """Best effort: a background agent cannot always take key-window status on 26.x, so
+        keyboard ownership is tracked by `focused` instead of asking AppKit."""
         send(send(cls("NSApplication"), "sharedApplication"), "activateIgnoringOtherApps:", None, (cbool,), True)
         send(self.win, "makeKeyAndOrderFront:", None, (vp,), None)
-        self.open_ = True
 
     def _sublayers(self, layer):
         subs = send(layer, "sublayers")
@@ -480,6 +571,7 @@ class Editor:
         if not self.open_:
             return
         self.open_ = False
+        self.focused = False
         self._end_text()
         send(self.win, "orderOut:", None, (vp,), None)
         if self.image:
@@ -488,11 +580,34 @@ class Editor:
 
     # -- geometry
     def frame_tl(self):
-        """Window content rect in global top-left coords."""
+        """Canvas rect (the image area, below the toolbar) in global top-left coords."""
         f = send(self.win, "frame", CGRect)
         cr = send(self.win, "contentRectForFrameRect:", CGRect, (CGRect,), f)
         main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
-        return CGRect(CGPoint(cr.origin.x, main_h - cr.origin.y - cr.size.h), cr.size)
+        h = cr.size.h - BAR_H
+        return CGRect(CGPoint(cr.origin.x + self.canvas_x, main_h - cr.origin.y - h), CGSize(cr.size.w - 2 * self.canvas_x, h))
+
+    def bar_hit(self, pt):
+        """Toolbar button id under a global top-left point, or None."""
+        f = send(self.win, "frame", CGRect)
+        cr = send(self.win, "contentRectForFrameRect:", CGRect, (CGRect,), f)
+        main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
+        top = main_h - cr.origin.y - cr.size.h  # content top, global TL
+        if not (cr.origin.x <= pt.x <= cr.origin.x + cr.size.w and top <= pt.y <= top + BAR_H):
+            return None
+        lx = pt.x - cr.origin.x
+        for bid, _, x0, x1 in self.buttons:
+            if x0 <= lx <= x1:
+                return bid
+        return "bar"
+
+    def button_centers_tl(self):
+        """{id: (x, y)} of each toolbar button in global top-left coords (for tests)."""
+        f = send(self.win, "frame", CGRect)
+        cr = send(self.win, "contentRectForFrameRect:", CGRect, (CGRect,), f)
+        main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
+        top = main_h - cr.origin.y - cr.size.h
+        return {bid: (cr.origin.x + (x0 + x1) / 2, top + BAR_H / 2) for bid, _, x0, x1 in self.buttons}
 
     def to_local(self, pt):
         """Global top-left point -> layer coords (bottom-left) or None if outside."""
@@ -538,16 +653,27 @@ class Editor:
         CG.CGPathRelease(path)
 
     # -- tap-driven events (global top-left points; return True if consumed)
-    def is_key(self):
-        return bool(send(self.win, "isKeyWindow", cbool))
-
     def mouse_down(self, pt, flags):
-        lp = self.to_local(pt)
-        if lp is None:
+        hit = self.bar_hit(pt)
+        lp = None if hit else self.to_local(pt)
+        if lp is None and hit is None:
+            self.focused = False  # clicked elsewhere: that app gets the keyboard back
+            self._end_text()
             return False
-        if not self.is_key():  # we swallow the click, so re-activate ourselves by hand
-            send(send(cls("NSApplication"), "sharedApplication"), "activateIgnoringOtherApps:", None, (cbool,), True)
-            send(self.win, "makeKeyAndOrderFront:", None, (vp,), None)
+        if not self.focused:
+            self.focused = True
+            self._activate()
+        if hit:
+            if hit in TOOLS:
+                self.set_tool(hit)
+            elif hit == "undo":
+                self.undo()
+            elif hit == "copy":
+                self.copy()
+            elif hit == "save":
+                self.save()
+            return True
+        assert lp is not None
         self._end_text()
         self.drag_start = lp
         if self.tool == "text":
@@ -631,13 +757,15 @@ class Editor:
         self.items.append(layer)
 
     def _begin_text(self, lp):
+        size = max(16.0, EDIT_STROKE * 5)
         t = send(cls("CATextLayer"), "layer")
         send(t, "setFont:", None, (vp,), nsstr("Helvetica-Bold"))
-        send(t, "setFontSize:", None, (f64,), max(14.0, EDIT_STROKE * 5))
+        send(t, "setFontSize:", None, (f64,), size)
         send(t, "setForegroundColor:", None, (vp,), cgcolor(*EDIT_COLOR))
         send(t, "setContentsScale:", None, (f64,), self.scale)
         send(t, "setWrapped:", None, (cbool,), False)
-        send(t, "setFrame:", None, (CGRect,), CGRect(CGPoint(lp.x, lp.y - EDIT_STROKE * 6), CGSize(self.sel_tl.size.w - lp.x, EDIT_STROKE * 6.5)))
+        # a full line box, baseline near the click; CATextLayer draws from the top of its frame
+        send(t, "setFrame:", None, (CGRect,), CGRect(CGPoint(lp.x, lp.y - size * 0.3), CGSize(self.sel_tl.size.w - lp.x, size * 1.3)))
         no_anim(lambda: send(self.ann, "addSublayer:", None, (vp,), t))
         self.text_layer, self.text_buf, self.text_pos = t, "", lp
         self._render_text(caret=True)
@@ -658,9 +786,9 @@ class Editor:
         self.text_buf = ""
 
     def key(self, keycode, flags, chars):
-        """Returns True if consumed. Only while our window is key: with the editor open but
-        another app in front, typing there must not be eaten."""
-        if not self.is_key():
+        """Returns True if consumed. Only while the editor owns the keyboard: with it open but
+        the user clicked into another app, typing there must not be eaten."""
+        if not self.focused:
             return False
         mods = flags & MODIFIER_MASK
         if self.text_layer is not None and mods & FLAG_CMD:
@@ -694,19 +822,19 @@ class Editor:
             self.close()
             return True
         if keycode in TOOL_KEYS and not mods:
-            self.tool = TOOL_KEYS[keycode]
-            send(self.win, "setTitle:", None, (vp,), nsstr(f"shot [{self.tool}] - A arrow  R box  P pen  T text  B pixelate  |  Cmd+C copy  Cmd+S save  Cmd+Z undo  Esc close"))
+            self.set_tool(TOOL_KEYS[keycode])
             return True
         return False
 
     def undo(self):
+        self._end_text()
         if self.items:
-            send(self.items.pop(), "removeFromSuperlayer")
+            no_anim(lambda: send(self.items.pop(), "removeFromSuperlayer"))
 
     def flattened(self):
         self._end_text()
         w_px, h_px = imaging.size(self.image)
-        return no_anim(lambda: imaging.flatten(self.root, w_px, h_px, self.scale))
+        return no_anim(lambda: imaging.flatten(self.canvas, w_px, h_px, self.scale))
 
     def copy(self):
         img = self.flattened()
@@ -749,6 +877,9 @@ def on_event(proxy, etype, event, refcon):
         if etype == kCGEventLeftMouseDown:
             S.anchor = S.cur = clamp_to_frame(CG.CGEventGetLocation(event))
             S.dragging = True
+            return None
+        if etype == kCGEventMouseMoved:
+            queue_refresh()  # keeps the crosshair asserted while hovering
             return None
         if etype == kCGEventLeftMouseDragged and S.dragging:
             S.cur = clamp_to_frame(CG.CGEventGetLocation(event))
@@ -843,7 +974,7 @@ def main():
     threading.Thread(target=lambda: trace(f"ocr warm in {imaging.warm_ocr():.0f} ms"), daemon=True).start()
 
     mask = ((1 << kCGEventKeyDown) | (1 << kCGEventLeftMouseDown) | (1 << kCGEventLeftMouseDragged)
-            | (1 << kCGEventLeftMouseUp) | (1 << kCGEventRightMouseDown))
+            | (1 << kCGEventLeftMouseUp) | (1 << kCGEventRightMouseDown) | (1 << kCGEventMouseMoved))
     daemon.install("shot", mask, on_event,
                    ready_msg=f"shot ready: {', '.join(f'{CFG[k]}={m}' for k, m in (('area_to_clipboard', 'copy'), ('ocr_to_clipboard', 'ocr'), ('area_to_editor', 'edit')) if CFG[k])}"
                              f"{' save_dir=' + SAVE_DIR if SAVE_DIR else ''} (config {CFG_PATH})")
