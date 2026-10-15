@@ -50,6 +50,7 @@ DEFAULTS = {
     "ocr_auto_language": False,     # let Vision guess the language (worse on short snippets: a lone x becomes Japanese)
     "editor_color": "#ff3b30",
     "editor_stroke": 4,
+    "editor_canvas": "#ffffff",     # the drawing margin you get by enlarging the editor window
     "debug": False,
 }
 CFG, CFG_PATH = config.load("shot", DEFAULTS)
@@ -76,6 +77,7 @@ def parse_color(s):
 
 EDIT_COLOR = parse_color(CFG["editor_color"])
 EDIT_STROKE = float(CFG["editor_stroke"])
+CANVAS_COLOR = parse_color(CFG["editor_canvas"])
 
 # --- AppKit / CoreAnimation helpers -------------------------------------------------
 # A styleMask of exactly 0 (plain borderless) from a background agent never reaches the
@@ -456,12 +458,14 @@ TOOLBAR = [("arrow", "↗", "A"), ("rect", "▭", "R"), ("pen", "✎", "P"), ("t
            None, ("undo", "↶", "⌘Z"), ("copy", "Copy", "⌘C"), ("save", "Save", "⌘S")]
 BAR_H = 34.0
 BTN_H, BTN_PAD, BTN_GAP = 24.0, 8.0, 5.0
+EDGE = 2.5  # window-edge band left to AppKit's resize grips (measured: the outer 2 pt of the frame)
 
 
 class Editor:
     """A titled window showing the shot at 1:1 points with an annotation layer on top.
     Drawing is done through the event tap too (the window never needs first-responder
-    plumbing), hit-tested against the window's frame."""
+    plumbing), hit-tested against the window's frame. Enlarging the window adds a drawing
+    margin around the shot; what you copy is the whole canvas (shot + margin)."""
 
     def __init__(self):
         self.win = None
@@ -471,7 +475,10 @@ class Editor:
         self.image = None
         self.sel_tl = CGRect()
         self.scale = 1.0
-        self.canvas_x = 0.0
+        self.w = self.h = 0.0       # the shot, in points
+        self.slack = 0.0            # toolbar width beyond a narrow shot (dark strips, not exported)
+        self.off = (0.0, 0.0)       # shot's top-left within the canvas (margin above/left of it)
+        self.cv: Any = None         # canvas (gx, gy, w, h) at the last layout, global top-left
         self.bar_min_w = 0.0
         self.buttons = []
         self.focused = False
@@ -483,7 +490,7 @@ class Editor:
         self.text_pos = None
 
     def _build(self, w, h):
-        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
         win = send(send(cls("NSWindow"), "alloc"), "initWithContentRect:styleMask:backing:defer:", vp,
                    (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(w, h + BAR_H)), style, NSBackingStoreBuffered, False)
         send(win, "setTitle:", None, (vp,), nsstr("shot"))
@@ -495,14 +502,18 @@ class Editor:
         send(view, "setWantsLayer:", None, (cbool,), True)
         root = send(view, "layer")
         send(root, "setBackgroundColor:", None, (vp,), cgcolor(0.11, 0.11, 0.12, 1.0))
-        # canvas = image + annotations, sits below the toolbar; flattened together on copy
+        # canvas = margin + shot + annotations, sits below the toolbar; flattened together on copy
         self.canvas = send(cls("CALayer"), "layer")
         send(self.canvas, "setMasksToBounds:", None, (cbool,), True)
+        send(self.canvas, "setBackgroundColor:", None, (vp,), cgcolor(*CANVAS_COLOR))
         send(root, "addSublayer:", None, (vp,), self.canvas)
+        # page = the shot and its annotations, moved as one; annotations may spill into the margin
+        self.page = send(cls("CALayer"), "layer")
+        send(self.canvas, "addSublayer:", None, (vp,), self.page)
         self.img_layer = send(cls("CALayer"), "layer")
-        send(self.canvas, "addSublayer:", None, (vp,), self.img_layer)
+        send(self.page, "addSublayer:", None, (vp,), self.img_layer)
         self.ann = send(cls("CALayer"), "layer")
-        send(self.canvas, "addSublayer:", None, (vp,), self.ann)
+        send(self.page, "addSublayer:", None, (vp,), self.ann)
         # toolbar strip along the top (Cocoa coords: top = high y)
         self.bar = send(cls("CALayer"), "layer")
         send(self.bar, "setBackgroundColor:", None, (vp,), cgcolor(0.16, 0.16, 0.17, 1.0))
@@ -531,6 +542,22 @@ class Editor:
         send(win, "setContentView:", None, (vp,), view)
         self.win, self.view, self.root = win, view, root
         self._paint_buttons()
+        ed = self
+
+        def relayout(_self, _cmd, _note):
+            ed._layout()
+
+        def should_close(_self, _cmd, _sender):
+            ed.close()  # the red button: hide and drop the shot like Esc does, never destroy the window
+            return False
+
+        k = define_class("ShotEditorDelegate", "NSObject", {
+            "windowDidResize:": (None, (vp,), relayout, "v@:@"),
+            "windowDidMove:": (None, (vp,), relayout, "v@:@"),
+            "windowShouldClose:": (cbool, (vp,), should_close, "B@:@"),
+        })
+        self.delegate = send(send(k, "alloc"), "init")
+        send(win, "setDelegate:", None, (vp,), self.delegate)
 
     def _paint_buttons(self):
         for bid, b, _, _ in self.buttons:
@@ -553,33 +580,56 @@ class Editor:
         self.tool = "pen"
         self.text_layer = None
         self.text_buf = ""
+        self.w, self.h = w, h
+        self.slack = float(math.ceil(max(0.0, self.bar_min_w - w)))  # narrow shot: centred under the wider toolbar; whole points keep the canvas integral
+        self.off = (0.0, 0.0)
+        self.cv = None
 
         def setup():
-            W = max(w, self.bar_min_w)
-            self.canvas_x = (W - w) / 2.0  # centre a narrow shot under a wider toolbar
-            send(self.canvas, "setFrame:", None, (CGRect,), CGRect(CGPoint(self.canvas_x, 0), CGSize(w, h)))
             send(self.img_layer, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
             send(self.img_layer, "setContents:", None, (vp,), img)
             send(self.img_layer, "setContentsScale:", None, (f64,), scale)
             send(self.ann, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
             for s in list(self._sublayers(self.ann)):
                 send(s, "removeFromSuperlayer")
-            send(self.bar, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, h), CGSize(W, BAR_H)))
             self._paint_buttons()
-            send(self.view, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(W, h + BAR_H)))
-            send(self.win, "setContentSize:", None, (CGSize,), CGSize(W, h + BAR_H))
+            # opens tight around the shot; any edge can be pulled out for drawing room, never in
+            W, H = w + self.slack, h + BAR_H
+            send(self.win, "setContentMinSize:", None, (CGSize,), CGSize(W, H))
+            send(self.win, "setContentSize:", None, (CGSize,), CGSize(W, H))
             # place it where the selection was (toolbar + title bar above), clamped to the display
             r = cocoa_rect(sel_tl)
             disp = CG.CGDisplayBounds(display_for_point(sel_tl.origin.x, sel_tl.origin.y))
             dc = cocoa_rect(disp)
-            ox = min(max(r.origin.x - self.canvas_x, dc.origin.x), dc.origin.x + dc.size.w - W)
-            oy = min(max(r.origin.y, dc.origin.y), dc.origin.y + dc.size.h - (h + BAR_H + 28))
+            ox = min(max(r.origin.x - self.slack / 2, dc.origin.x), dc.origin.x + dc.size.w - W)
+            oy = min(max(r.origin.y, dc.origin.y), dc.origin.y + dc.size.h - (H + 28))
             send(self.win, "setFrameOrigin:", None, (CGPoint,), CGPoint(ox, oy))
+            self._layout()
 
         no_anim(setup)
         self._activate()
         self.open_ = True
         self.focused = True  # owns the keyboard until a click lands outside the window
+
+    def _layout(self):
+        """Fit canvas, shot and toolbar to the current window. Across a resize the shot keeps
+        its place on screen, so the room appears on the side you pulled; the window cannot
+        get smaller than the shot (content min size), so the clamp only trims rounding."""
+        if not self.win or not self.w:
+            return
+        gx, gy, cw, ch = self._canvas_tl()
+        if self.cv is not None and (self.cv[2], self.cv[3]) != (cw, ch):
+            self.off = (self.cv[0] + self.off[0] - gx, self.cv[1] + self.off[1] - gy)
+        self.off = (min(max(self.off[0], 0.0), max(0.0, cw - self.w)), min(max(self.off[1], 0.0), max(0.0, ch - self.h)))
+        self.cv = (gx, gy, cw, ch)
+        ox, oy = self.off
+
+        def apply():
+            send(self.canvas, "setFrame:", None, (CGRect,), CGRect(CGPoint(self.slack / 2, 0), CGSize(cw, ch)))
+            send(self.page, "setFrame:", None, (CGRect,), CGRect(CGPoint(ox, ch - oy - self.h), CGSize(self.w, self.h)))
+            send(self.bar, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, ch), CGSize(cw + self.slack, BAR_H)))
+
+        no_anim(apply)
 
     def _activate(self):
         """Best effort: a background agent cannot always take key-window status on 26.x, so
@@ -608,13 +658,27 @@ class Editor:
             self.image = None
 
     # -- geometry
-    def frame_tl(self):
-        """Canvas rect (the image area, below the toolbar) in global top-left coords."""
+    def _canvas_tl(self):
+        """Canvas (margin + shot, below the toolbar) as (x, y, w, h) in global top-left coords."""
         f = send(self.win, "frame", CGRect)
         cr = send(self.win, "contentRectForFrameRect:", CGRect, (CGRect,), f)
         main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
-        h = cr.size.h - BAR_H
-        return CGRect(CGPoint(cr.origin.x + self.canvas_x, main_h - cr.origin.y - h), CGSize(cr.size.w - 2 * self.canvas_x, h))
+        ch = cr.size.h - BAR_H
+        return cr.origin.x + self.slack / 2, main_h - cr.origin.y - ch, cr.size.w - self.slack, ch
+
+    def _window_tl(self):
+        f = send(self.win, "frame", CGRect)
+        main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
+        return f.origin.x, main_h - f.origin.y - f.size.h, f.size.w, f.size.h
+
+    def in_window(self, pt):
+        x, y, w, h = self._window_tl()
+        return x <= pt.x <= x + w and y <= pt.y <= y + h
+
+    def on_resize_edge(self, pt):
+        """Inside the window but within EDGE of its left/right/bottom edge: AppKit's resize grip."""
+        x, y, w, h = self._window_tl()
+        return self.in_window(pt) and (pt.x < x + EDGE or pt.x > x + w - EDGE or pt.y > y + h - EDGE)
 
     def bar_hit(self, pt):
         """Toolbar button id under a global top-left point, or None."""
@@ -639,12 +703,13 @@ class Editor:
         return {bid: (cr.origin.x + (x0 + x1) / 2, top + BAR_H / 2) for bid, _, x0, x1 in self.buttons}
 
     def to_local(self, pt):
-        """Global top-left point -> layer coords (bottom-left) or None if outside."""
-        f = self.frame_tl()
-        x, y = pt.x - f.origin.x, pt.y - f.origin.y
-        if not (0 <= x <= f.size.w and 0 <= y <= f.size.h):
+        """Global top-left point -> shot-local coords (bottom-left origin at the shot's corner;
+        outside 0..w/0..h means in the margin) or None if not on the canvas."""
+        gx, gy, cw, ch = self._canvas_tl()
+        x, y = pt.x - gx, pt.y - gy
+        if not (0 <= x <= cw and 0 <= y <= ch):
             return None
-        return CGPoint(x, f.size.h - y)
+        return CGPoint(x - self.off[0], self.h - (y - self.off[1]))
 
     # -- drawing primitives (all return a CALayer added to self.ann)
     def _shape(self):
@@ -683,12 +748,15 @@ class Editor:
 
     # -- tap-driven events (global top-left points; return True if consumed)
     def mouse_down(self, pt, flags):
+        if self.on_resize_edge(pt):
+            return False  # AppKit resizes; we stay focused
         hit = self.bar_hit(pt)
         lp = None if hit else self.to_local(pt)
         if lp is None and hit is None:
-            self.focused = False  # clicked elsewhere: that app gets the keyboard back
-            self._end_text()
-            return False
+            if not self.in_window(pt):
+                self.focused = False  # clicked into another app: it gets the keyboard back
+                self._end_text()
+            return False  # (else the title bar: AppKit moves the window)
         if not self.focused:
             self.focused = True
             self._activate()
@@ -725,8 +793,9 @@ class Editor:
         return True
 
     def _local_clamped(self, pt):
-        f = self.frame_tl()
-        return CGPoint(min(max(pt.x - f.origin.x, 0), f.size.w), f.size.h - min(max(pt.y - f.origin.y, 0), f.size.h))
+        gx, gy, cw, ch = self._canvas_tl()
+        x, y = min(max(pt.x - gx, 0.0), cw), min(max(pt.y - gy, 0.0), ch)
+        return CGPoint(x - self.off[0], self.h - (y - self.off[1]))
 
     def _update_live(self, b):
         a = self.drag_start
@@ -769,9 +838,13 @@ class Editor:
 
     def _pixelate(self, a, b):
         sc = self.scale
-        x0, y0 = min(a.x, b.x), min(a.y, b.y)
-        w, h = abs(b.x - a.x), abs(b.y - a.y)
-        H = self.sel_tl.size.h
+        # only the shot has pixels to scramble: clip the drag to it
+        x0, y0 = max(0.0, min(a.x, b.x)), max(0.0, min(a.y, b.y))
+        x1, y1 = min(self.w, max(a.x, b.x)), min(self.h, max(a.y, b.y))
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            return
+        w, h = x1 - x0, y1 - y0
+        H = self.h
         # image pixel rect: top-left origin
         px = CGRect(CGPoint(round(x0 * sc), round((H - y0 - h) * sc)), CGSize(round(w * sc), round(h * sc)))
         mosaic = imaging.pixelate(self.image, px, max(6, int(8 * sc)))
@@ -794,7 +867,8 @@ class Editor:
         send(t, "setContentsScale:", None, (f64,), self.scale)
         send(t, "setWrapped:", None, (cbool,), False)
         # a full line box, baseline near the click; CATextLayer draws from the top of its frame
-        send(t, "setFrame:", None, (CGRect,), CGRect(CGPoint(lp.x, lp.y - size * 0.3), CGSize(self.sel_tl.size.w - lp.x, size * 1.3)))
+        right = self._canvas_tl()[2] - self.off[0]  # canvas' right edge, shot-local
+        send(t, "setFrame:", None, (CGRect,), CGRect(CGPoint(lp.x, lp.y - size * 0.3), CGSize(max(40.0, right - lp.x), size * 1.3)))
         no_anim(lambda: send(self.ann, "addSublayer:", None, (vp,), t))
         self.text_layer, self.text_buf, self.text_pos = t, "", lp
         self._render_text(caret=True)
@@ -861,9 +935,10 @@ class Editor:
             no_anim(lambda: send(self.items.pop(), "removeFromSuperlayer"))
 
     def flattened(self):
+        """The whole canvas: margin, shot and annotations, at the shot's pixel density."""
         self._end_text()
-        w_px, h_px = imaging.size(self.image)
-        return no_anim(lambda: imaging.flatten(self.canvas, w_px, h_px, self.scale))
+        _, _, cw, ch = self._canvas_tl()
+        return no_anim(lambda: imaging.flatten(self.canvas, round(cw * self.scale), round(ch * self.scale), self.scale))
 
     def copy(self):
         img = self.flattened()

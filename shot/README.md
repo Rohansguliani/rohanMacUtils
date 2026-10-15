@@ -28,6 +28,11 @@ The editor owns the keyboard until you click somewhere else; click back into it 
 continue. Capture hotkeys still work while it is open (Opt+1 closes it and starts a new
 capture).
 
+It opens tight around the shot. Pull any window edge to get drawing room around it: the
+shot stays where it is on screen and the margin (white; `editor_canvas`) appears on the side
+you pulled. Copy/save export the whole canvas, margin included. The window cannot be made
+smaller than the shot.
+
 ## Why it is fast, and why the screen freezes
 
 On the hotkey the display under the cursor is captured with `CGWindowListCreateImage`
@@ -55,6 +60,7 @@ Vision model is warmed at startup).
   "ocr_auto_language": false,
   "editor_color": "#ff3b30",
   "editor_stroke": 4,
+  "editor_canvas": "#ffffff",
   "debug": false
 }
 ```
