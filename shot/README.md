@@ -6,14 +6,14 @@ Area screenshots, OCR, and a quick annotate-and-copy editor. A Shottr replacemen
 |---|---|
 | **Opt+1** | drag an area → PNG on the clipboard (and a file, if `save_dir` is set) |
 | **Opt+2** | drag an area → the text in it on the clipboard (Apple Vision OCR, on-device) |
-| **Opt+`** | drag an area → editor window |
+| **Opt+`** | open the **last** Opt+1 / Opt+2 capture in the editor (nothing captured yet → area selection straight into the editor) |
 
 While selecting: **Esc** or right-click cancels. The selection shows true pixels inside the
 frame and the size in points below it. Releasing with a selection smaller than 2×2 cancels.
 
 ## Editor
 
-Opens at the spot you selected, with a toolbar across the top. Click a tool or press its
+Opens over the spot the capture came from, with a toolbar across the top. Click a tool or press its
 key:
 
 | key | tool | | key | action |
@@ -49,7 +49,7 @@ Vision model is warmed at startup).
 {
   "area_to_clipboard": "opt+1",
   "ocr_to_clipboard": "opt+2",
-  "area_to_editor": "opt+`",
+  "edit_last": "opt+`",
   "save_dir": "",
   "ocr_languages": ["en-US"],
   "ocr_auto_language": false,

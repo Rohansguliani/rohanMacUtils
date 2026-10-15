@@ -3,8 +3,9 @@
 
   Opt+1   drag an area -> PNG on the clipboard (and optionally a file)
   Opt+2   drag an area -> the text in it (Apple Vision OCR) on the clipboard
-  Opt+`   drag an area -> editor window: arrows, boxes, pen, text, pixelate; Cmd+C copies
-          the annotated image, Cmd+S saves it, Esc closes
+  Opt+`   the last Opt+1 / Opt+2 capture in the editor: arrows, boxes, pen, text, pixelate;
+          Cmd+C copies the annotated image, Cmd+S saves it, Esc closes. (Nothing captured
+          yet -> starts an area selection that opens straight into the editor.)
 
 The selection overlay is a pre-built, always-resident full-screen panel: the hotkey only
 orders it front, so there is nothing to construct, load, or warm when you press it. The
@@ -43,7 +44,7 @@ APPKIT = C.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
 DEFAULTS = {
     "area_to_clipboard": "opt+1",
     "ocr_to_clipboard": "opt+2",
-    "area_to_editor": "opt+`",
+    "edit_last": "opt+`",
     "save_dir": "",                 # also write Opt+1 shots here, e.g. "~/Desktop"; "" = clipboard only
     "ocr_languages": ["en-US"],     # Vision language codes, in priority order
     "ocr_auto_language": False,     # let Vision guess the language (worse on short snippets: a lone x becomes Japanese)
@@ -53,7 +54,7 @@ DEFAULTS = {
 }
 CFG, CFG_PATH = config.load("shot", DEFAULTS)
 HK = {}
-for key, mode in (("area_to_clipboard", "copy"), ("ocr_to_clipboard", "ocr"), ("area_to_editor", "edit")):
+for key, mode in (("area_to_clipboard", "copy"), ("ocr_to_clipboard", "ocr"), ("edit_last", "edit")):
     if CFG[key]:
         HK[config.parse_hotkey(CFG[key])] = mode
 if not HK:
@@ -344,12 +345,36 @@ def finish(sel_tl: CGRect):
     if not img:
         log("crop failed")
         return
+    remember(img, sel_tl, sc)
     if mode == "copy":
         threading.Thread(target=_deliver_copy, args=(img, sel_tl), daemon=True).start()
     elif mode == "ocr":
         threading.Thread(target=_deliver_ocr, args=(img, sel_tl), daemon=True).start()
     else:
         main_async(lambda: _EDITOR.open(img, sel_tl, sc))
+
+
+_LAST: Any = None  # (retained CGImageRef, sel_tl, scale) of the most recent capture, for Opt+`
+
+
+def remember(img, sel_tl, scale):
+    global _LAST
+    if _LAST:
+        CG.CGImageRelease(_LAST[0])
+    _LAST = (CG.CGImageRetain(img), sel_tl, scale)
+
+
+def open_last():
+    """Opt+`: the last Opt+1 / Opt+2 capture in the editor. Already open -> just bring it
+    back; nothing captured yet -> fall back to a fresh selection that opens the editor."""
+    if _EDITOR.open_:
+        main_async(_EDITOR.refocus)
+        return
+    if _LAST is None:
+        begin("edit")
+        return
+    img, sel_tl, sc = _LAST
+    main_async(lambda: _EDITOR.open(CG.CGImageRetain(img), sel_tl, sc))
 
 
 def _deliver_copy(img, sel_tl):
@@ -561,6 +586,10 @@ class Editor:
         keyboard ownership is tracked by `focused` instead of asking AppKit."""
         send(send(cls("NSApplication"), "sharedApplication"), "activateIgnoringOtherApps:", None, (cbool,), True)
         send(self.win, "makeKeyAndOrderFront:", None, (vp,), None)
+
+    def refocus(self):
+        self.focused = True
+        self._activate()
 
     def _sublayers(self, layer):
         subs = send(layer, "sublayers")
@@ -929,6 +958,9 @@ def on_event(proxy, etype, event, refcon):
         return event
     if CG.CGEventGetIntegerValueField(event, 8):  # autorepeat
         return None
+    if mode == "edit":
+        open_last()
+        return None
     if _EDITOR is not None and _EDITOR.open_:
         main_sync(_EDITOR.close)
     begin(mode)
@@ -976,7 +1008,7 @@ def main():
     mask = ((1 << kCGEventKeyDown) | (1 << kCGEventLeftMouseDown) | (1 << kCGEventLeftMouseDragged)
             | (1 << kCGEventLeftMouseUp) | (1 << kCGEventRightMouseDown) | (1 << kCGEventMouseMoved))
     daemon.install("shot", mask, on_event,
-                   ready_msg=f"shot ready: {', '.join(f'{CFG[k]}={m}' for k, m in (('area_to_clipboard', 'copy'), ('ocr_to_clipboard', 'ocr'), ('area_to_editor', 'edit')) if CFG[k])}"
+                   ready_msg=f"shot ready: {', '.join(f'{CFG[k]}={m}' for k, m in (('area_to_clipboard', 'copy'), ('ocr_to_clipboard', 'ocr'), ('edit_last', 'edit')) if CFG[k])}"
                              f"{' save_dir=' + SAVE_DIR if SAVE_DIR else ''} (config {CFG_PATH})")
     send(app, "run")
 

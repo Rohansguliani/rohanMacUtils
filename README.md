@@ -9,7 +9,7 @@ LaunchAgent.
 |---|---|---|---|
 | [`alttab/`](alttab/) | AltTab | Opt+Tab window switcher scoped to the current Space, live thumbnails, frozen MRU order | Accessibility, Screen Recording |
 | [`snap/`](snap/) | Rectangle | Opt+arrows halves, drag-to-edge, companion auto-snap / picker, linked seam resize | Accessibility |
-| [`shot/`](shot/) | Shottr | Opt+1 area → clipboard, Opt+2 area → OCR text, Opt+` area → annotate (arrow, box, pen, text, pixelate) | Accessibility, Screen Recording |
+| [`shot/`](shot/) | Shottr | Opt+1 area → clipboard, Opt+2 area → OCR text, Opt+` annotate the last capture (arrow, box, pen, text, pixelate) | Accessibility, Screen Recording |
 | [`spaceswitch/`](spaceswitch/) | — | Instant Spaces switching: removes the slide animation from your shortcuts and swipes, instant Mission Control | Accessibility |
 | [`logimouse/`](logimouse/) | Logi Options+ | Logitech MX gesture button and thumb wheel as keystrokes, optional main-wheel inversion — HID++ directly, no Logi software | Input Monitoring, Accessibility |
 
