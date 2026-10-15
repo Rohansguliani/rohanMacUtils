@@ -466,7 +466,7 @@ class Editor:
     def __init__(self):
         self.win = None
         self.open_ = False
-        self.tool = "arrow"
+        self.tool = "pen"
         self.items = []     # CALayers in paint order (undo stack)
         self.image = None
         self.sel_tl = CGRect()
@@ -550,7 +550,7 @@ class Editor:
             self._build(w, h)
         self.image, self.sel_tl, self.scale = img, sel_tl, scale
         self.items = []
-        self.tool = "arrow"
+        self.tool = "pen"
         self.text_layer = None
         self.text_buf = ""
 

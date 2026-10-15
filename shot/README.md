@@ -18,9 +18,9 @@ key:
 
 | key | tool | | key | action |
 |---|---|---|---|---|
-| **A** | arrow (default) | | **Cmd+C** | copy annotated image and close |
+| **A** | arrow | | **Cmd+C** | copy annotated image and close |
 | **R** | box | | **Cmd+S** | save PNG to `save_dir` (or ~/Desktop) and close |
-| **P** | pen (free draw) | | **Cmd+Z** | undo last item |
+| **P** | pen (free draw, default) | | **Cmd+Z** | undo last item |
 | **T** | text: click, type, Return | | **Esc** / **Cmd+W** | close without copying |
 | **B** | pixelate a region | | | |
 
