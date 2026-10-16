@@ -41,7 +41,9 @@ and **Accessibility** (to post the keystrokes). See the top-level README.
 
 Any HID++ 2.0 mouse exposing feature `0x1B04` (Reprogrammable Controls v4). Developed
 against an MX Master 2S; the other MX / Lift / M720-class mice expose the same feature. The
-control IDs for the gesture button and thumb wheel are discovered from the device's own
-control table at start, not hardcoded; `debug: true` prints the table. Receiver, Bluetooth,
-and USB-C cable paths are handled, and the daemon re-attaches when the mouse sleeps and
-wakes.
+daemon reads the device's own control table at start and diverts exactly one control, the
+gesture button (CID `0x00C3`) — never middle/back/forward/SmartShift, which are divertable
+too and would silently stop working. The table is logged on attach (`*` = divertable).
+Receiver, Bluetooth, and USB-C cable paths are handled (a mouse on Bluetooth is preferred
+over an idle receiver), the daemon re-attaches when the mouse sleeps and wakes, and it gives
+the button back to the mouse when it is stopped.

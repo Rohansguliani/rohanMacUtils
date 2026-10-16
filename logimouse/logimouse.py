@@ -23,6 +23,7 @@ Permissions: Accessibility (event tap) + Input Monitoring (IOHID open), both gra
 import ctypes as C
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -89,15 +90,20 @@ FEAT_IROOT = 0x0000                       # getFeature(featureId) -> index
 FEAT_REPROG_V4 = 0x1B04
 # 0x1B04 functions
 FN_GET_COUNT, FN_GET_CID_INFO, FN_GET_CID_REPORTING, FN_SET_CID_REPORTING = 0, 1, 2, 3
-# getCidInfo flags byte (byte 6 of the reply): bit5 = divertable, bit6 = persist, bit7 = virtual
+# getCidInfo flags byte (byte 8 of the reply): bit4 = reprogrammable, bit5 = divertable,
+# bit6 = persistently divertable, bit7 = virtual. Left/right click are never divertable.
 CID_FLAG_DIVERTABLE = 0x20
 # setCidReporting flags: bit0 = divert, bit1 = dvalid (divert field valid)
-DIVERT_ON = 0x03
+DIVERT_ON, DIVERT_OFF = 0x03, 0x02
+# The one control we take over. Middle/back/forward/SmartShift are divertable too on an MX,
+# and diverting them would silently break those buttons, so the table is only consulted to
+# confirm this one exists and is divertable.
+GESTURE_CID = 0x00C3
 # Logitech vendor usage pages: 0xFF43 = BLE / modern HID++ 2.0, 0xFF00 = Unifying / Bolt / USB
 VENDOR_USAGE_PAGES = (0xFF43, 0xFF00)
 # HID++ device index: 0xFF = direct (BLE/USB) or the receiver itself; 1..6 = receiver slots
 CANDIDATE_DEVIDS = (0xFF, 1, 2, 3, 4, 5, 6)
-MAX_UNANSWERED = 3                        # ticks (~15 s) before giving up on a mute handle
+MAX_UNANSWERED = 3                        # 5 s ticks without a HID++ reply before giving up on a handle
 REASSERT_S = 60.0                         # re-divert cadence; a no-op if already diverted
 
 
@@ -111,16 +117,18 @@ class State:
     feat_idx = None       # 0x1B04's index on this device
     cid_count = None      # from getCount
     cids_probed = 0       # how many getCidInfo replies we have
-    divertable = []       # [(cid, tid)] discovered from the control table
+    table = []            # [(cid, flags)] from the control table
+    gesture_ok = None     # None = table incomplete; False = no divertable gesture button; True = divert it
     diverted_at = None
     down = False
+    probed = False        # the IRoot probe went out on this handle; wait for the tick before judging it
     unanswered = 0
     last_log = None
 
 
 S = State()
 _refs = []
-_q = queue.Queue(maxsize=16)   # IOHIDDeviceSetReport blocks ~250 ms on an idle BLE mouse: never on the main thread
+_q = queue.Queue(maxsize=64)   # IOHIDDeviceSetReport blocks 20-250 ms on a BLE mouse: never on the main thread
 _last_wheel = 0.0
 
 
@@ -185,19 +193,24 @@ def on_report(ctx, res, sender, rtype, rid, report, length):
         if fn == FN_GET_COUNT:
             S.cid_count = b[4]
             S.cids_probed = 0
-            S.divertable = []
+            S.table = []
+            S.gesture_ok = None
             for i in range(S.cid_count):
                 send(S.dev_idx, S.feat_idx, FN_GET_CID_INFO, bytes([i]))
         elif fn == FN_GET_CID_INFO:
-            cid, tid, flags = (b[4] << 8) | b[5], (b[6] << 8) | b[7], b[8]
+            cid, flags = (b[4] << 8) | b[5], b[8]
             S.cids_probed += 1
-            if flags & CID_FLAG_DIVERTABLE and cid not in (c for c, _ in S.divertable):
-                S.divertable.append((cid, tid))
+            if cid not in (c for c, _ in S.table):
+                S.table.append((cid, flags))
             if S.cid_count is not None and S.cids_probed >= S.cid_count:
-                log("control table: %d controls, divertable: %s" % (S.cid_count, ["%04x" % c for c, _ in S.divertable]))
+                S.gesture_ok = any(c == GESTURE_CID and f & CID_FLAG_DIVERTABLE for c, f in S.table)
+                log("control table: %s; %s" % (
+                    " ".join("%04x%s" % (c, "*" if f & CID_FLAG_DIVERTABLE else "") for c, f in S.table),
+                    "diverting the gesture button (%04x)" % GESTURE_CID if S.gesture_ok
+                    else "no divertable gesture button (%04x): nothing diverted" % GESTURE_CID))
                 reconcile()
         elif fn == FN_SET_CID_REPORTING:
-            log_once("diverted %s" % ["%04x" % c for c, _ in S.divertable])
+            log_once("gesture button diverted")
         return
     if b[3] == 0x00:  # divertedButtonsEvent: up to 4 pressed CIDs (big-endian), 0 = none
         n = min(4, (len(b) - 4) // 2)
@@ -222,6 +235,9 @@ def has_vendor_page(dev):
 
 
 def present_devices():
+    """Logitech HID handles that carry a HID++ collection, direct devices (BLE/USB, page 0xFF43)
+    before receivers (0xFF00): a mouse on Bluetooth answers on its own handle, and the
+    receiver only matters when the mouse is connected through it."""
     s = IOK.IOHIDManagerCopyDevices(S.mgr) if S.mgr else None
     if not s:
         return []
@@ -232,10 +248,17 @@ def present_devices():
     devs = [arr[i] for i in range(n) if has_vendor_page(arr[i])]
     CF.CFRelease(s)
 
-    def primary_is_vendor(d):
-        p = IOK.IOHIDDeviceGetProperty(d, K_PRIMARY_USAGE_PAGE)
-        return 0 if (p and cf_to_i64(p) in VENDOR_USAGE_PAGES) else 1
-    devs.sort(key=primary_is_vendor)
+    def pages(d):
+        out = set()
+        pup = IOK.IOHIDDeviceGetProperty(d, K_PRIMARY_USAGE_PAGE)
+        if pup:
+            out.add(cf_to_i64(pup))
+        pairs = IOK.IOHIDDeviceGetProperty(d, K_DEVICE_USAGE_PAIRS)
+        if pairs:
+            for i in range(CF.CFArrayGetCount(pairs)):
+                out.add(cf_to_i64(CF.CFDictionaryGetValue(CF.CFArrayGetValueAtIndex(pairs, i), K_DEVICE_USAGE_PAGE)))
+        return out
+    devs.sort(key=lambda d: 0 if 0xFF43 in pages(d) else 1)
     return devs
 
 
@@ -243,11 +266,21 @@ def drop():
     if S.dev:
         IOK.IOHIDDeviceClose(S.dev, 0)
         CF.CFRelease(S.dev)
-    S.dev = S.buf = S.dev_idx = S.feat_idx = S.cid_count = S.diverted_at = None
-    S.divertable, S.cids_probed, S.down, S.unanswered = [], 0, False, 0
+    S.dev = S.buf = S.dev_idx = S.feat_idx = S.cid_count = S.diverted_at = S.gesture_ok = None
+    S.table, S.cids_probed, S.down, S.probed, S.unanswered = [], 0, False, False, 0
 
 
-def reconcile(*_):
+def on_device(*_):
+    """IOHIDManager matching/removal callback. Several Logitech handles enumerate in a burst,
+    so this must not count as a tick: it only attaches and fires the first probe."""
+    reconcile(tick=False)
+
+
+def on_tick():
+    reconcile(tick=True)
+
+
+def reconcile(tick=False):
     present = present_devices()
     if S.dev and not any(CF.CFEqual(S.dev, d) for d in present):
         log_once("mouse detached")
@@ -270,13 +303,17 @@ def reconcile(*_):
         IOK.IOHIDDeviceRegisterInputReportCallback(S.dev, S.buf, 64, _refs[0], None)
         log_once("mouse attached")
     if S.feat_idx is None:
-        if S.unanswered >= MAX_UNANSWERED:
-            log_once("no HID++ answer on this handle; dropping it")
-            drop()
-            return
-        S.unanswered += 1
+        if tick:
+            S.unanswered += 1
+            if S.unanswered > MAX_UNANSWERED:
+                log_once("no HID++ answer on this handle; dropping it")
+                drop()
+                return
+        elif S.probed:
+            return  # a device burst; the probe is out, the tick will judge it
+        S.probed = True
         pup = IOK.IOHIDDeviceGetProperty(S.dev, K_PRIMARY_USAGE_PAGE)
-        dev_ids = CANDIDATE_DEVIDS if (pup and cf_to_i64(pup) in VENDOR_USAGE_PAGES) else (0xFF,)
+        dev_ids = CANDIDATE_DEVIDS if (pup and cf_to_i64(pup) == 0xFF00) else (0xFF,)  # receiver slots only on a receiver
         for d in dev_ids:
             send(d, FEAT_IROOT, 0, bytes([FEAT_REPROG_V4 >> 8, FEAT_REPROG_V4 & 0xFF]))
         return
@@ -285,13 +322,24 @@ def reconcile(*_):
         return
     if S.cids_probed < S.cid_count:
         return  # table still arriving
-    if not S.divertable or GESTURE_KEY is None:
+    if not S.gesture_ok or GESTURE_KEY is None:
         return
     now = time.monotonic()
     if S.diverted_at is None or now - S.diverted_at >= REASSERT_S:
         S.diverted_at = now
-        for cid, _ in S.divertable:
-            send(S.dev_idx, S.feat_idx, FN_SET_CID_REPORTING, bytes([cid >> 8, cid & 0xFF, DIVERT_ON]))
+        send(S.dev_idx, S.feat_idx, FN_SET_CID_REPORTING, bytes([GESTURE_CID >> 8, GESTURE_CID & 0xFF, DIVERT_ON]))
+
+
+def undivert_and_exit(*_):
+    """SIGTERM (launchctl bootout / install.sh restart): give the button back to the mouse
+    before dying, synchronously; otherwise it stays dead until the mouse power-cycles."""
+    if S.dev and S.feat_idx is not None and S.diverted_at is not None:
+        msg = bytes([HIDPP_LONG_REPORT, S.dev_idx, S.feat_idx, (FN_SET_CID_REPORTING << 4) | HIDPP_SWID,
+                     GESTURE_CID >> 8, GESTURE_CID & 0xFF, DIVERT_OFF])
+        out = (C.c_uint8 * 20)(*(msg + bytes(20 - len(msg))))
+        IOK.IOHIDDeviceSetReport(S.dev, kIOHIDReportTypeOutput, HIDPP_LONG_REPORT, out, 20)
+        log("hidpp: gesture button given back to the mouse")
+    os._exit(0)
 
 
 def setup_hid():
@@ -302,7 +350,7 @@ def setup_hid():
     CF.CFRelease(match)
     CF.CFRelease(n_vid)
     threading.Thread(target=writer, name="hidpp-writer", daemon=True).start()
-    _refs.extend([REPORT_CB(on_report), DEVICE_CB(reconcile)])
+    _refs.extend([REPORT_CB(on_report), DEVICE_CB(on_device)])
     IOK.IOHIDManagerRegisterDeviceMatchingCallback(S.mgr, _refs[1], None)
     IOK.IOHIDManagerRegisterDeviceRemovalCallback(S.mgr, _refs[1], None)
     IOK.IOHIDManagerScheduleWithRunLoop(S.mgr, CF.CFRunLoopGetCurrent(), kCFRunLoopCommonModes)
@@ -311,7 +359,9 @@ def setup_hid():
         log("hidpp: IOHIDManagerOpen failed %#x; gesture button disabled" % (r & 0xFFFFFFFF))
         S.mgr = None
         return
-    reconcile()
+    signal.signal(signal.SIGTERM, undivert_and_exit)
+    signal.signal(signal.SIGINT, undivert_and_exit)
+    reconcile(tick=False)
 
 
 # --- scroll wheel (event tap) --------------------------------------------------
@@ -361,7 +411,7 @@ def main():
         print("config OK:", CFG_PATH)
         return
     setup_hid()
-    daemon.run("logimouse", 1 << kCGEventScrollWheel, on_event, on_tick=reconcile,
+    daemon.run("logimouse", 1 << kCGEventScrollWheel, on_event, on_tick=on_tick,
                ready_msg="logimouse ready: gesture=%s wheel=%s/%s invert=%s (%s)" % (
                    CFG["gesture_button"] or "off", CFG["thumb_wheel_left"] or "off",
                    CFG["thumb_wheel_right"] or "off", CFG["invert_main_wheel"], CFG_PATH))
