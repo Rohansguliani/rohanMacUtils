@@ -33,15 +33,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import config  # noqa: E402
 import daemon  # noqa: E402
 from cards import CardHUD, cgcolor  # noqa: E402
-from macbridge import (AX, AX_GET_WINDOW, CF, CG, CID, SL, TIMER_CB, CGPoint, CGRect, CGSize, FLAG_SHIFT,  # noqa: E402
+from macbridge import (AX, AX_GET_WINDOW, CF, CG, CID, SL, CGPoint, CGRect, CGSize, FLAG_SHIFT,  # noqa: E402
                        MODIFIER_MASK, cbool, cfstr, f64, i32, i64, kAXErrorInvalidUIElement, kAXValueTypeCGPoint,
-                       kAXValueTypeCGSize, kCFNumberSInt64Type, kCFRunLoopCommonModes, kCFTypeArrayCallBacks,
+                       kAXValueTypeCGSize, kCFNumberSInt64Type, kCFTypeArrayCallBacks,
                        kCGEventKeyDown, kCGEventLeftMouseDown, kCGEventLeftMouseDragged, kCGEventLeftMouseUp,
                        kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput, kCGKeyboardEventAutorepeat,
                        kCGKeyboardEventKeycode, log, u32, u64, vp)
-from objc import cls, send  # noqa: E402
-from windows import (focus_window_async, ordered_windows_for_session, snapshot_current_space_windows,  # noqa: E402
-                     update_thumb, warm_thumbnails_async)
+from objc import autorelease_pool, cls, send  # noqa: E402
+from windows import (focus_window_async, ordered_windows_for_session, prune_thumbs, schedule_thumb_refresh,  # noqa: E402
+                     snapshot_current_space_windows, warm_thumbnails_async)
 
 OWN_PID = os.getpid()
 
@@ -82,13 +82,10 @@ KEY_TAB, KEY_ESC, KEY_RETURN, KEY_SPACE, KEY_J, KEY_K = 48, 53, 36, 49, 38, 40
 KEY_LEFT, KEY_RIGHT, KEY_DOWN, KEY_UP = 123, 124, 125, 126
 
 _HUD: Any = None  # CardHUD for the companion picker, created in main()
-_PICKER_DIRTY = False
 
 
-def _mark_dirty():
-    global _PICKER_DIRTY
-    _PICKER_DIRTY = True
-    CF.CFRunLoopWakeUp(CF.CFRunLoopGetMain())
+def _on_thumbs_changed():
+    daemon.main_async(lambda: _PICKER.active and _HUD.refresh_thumbnails_in_place(_PICKER.windows))
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +154,13 @@ def window_bounds(wid: int) -> CGRect:
     return r
 
 
-_AX_WIN_CACHE = {}  # wid -> AXUIElementRef (retained)
+_AX_WIN_CACHE = {}  # wid -> AXUIElementRef (retained); pruned against live windows on the idle tick
+
+
+def prune_ax_cache():
+    wcid = i32(0)
+    for wid in [w for w in _AX_WIN_CACHE if SL.SLSGetWindowOwner(CID, w, C.byref(wcid)) != 0]:
+        CF.CFRelease(_AX_WIN_CACHE.pop(wid))
 
 
 def ax_window_for_wid(pid: int, wid: int):
@@ -241,6 +244,17 @@ def ax_follow_edge(pid: int, wid: int, edge: str, start: CGRect, lead) -> bool:
     return rc == 0
 
 
+def _wait_bounds_change(wid: int, before, timeout_s: float = 0.03):
+    """Poll the window server (cheap) until the bounds differ from `before` or the budget ends:
+    a responsive app returns in ~2-5 ms instead of always paying the full wait."""
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        now = _frame_tuple(window_bounds(wid))
+        if now != before or time.perf_counter() >= deadline:
+            return now
+        time.sleep(0.002)
+
+
 def snap_worker():
     while True:
         job = _SNAP_Q.get()
@@ -248,25 +262,25 @@ def snap_worker():
         linked = len(job) > 4 and job[4] == "linked"
         t0 = time.perf_counter()
         followers = {}
+        start = _frame_tuple(window_bounds(wid))
         if linked and CFG["linked_resize"]:
             with _FOLLOW_LOCK:
-                start = _frame_tuple(window_bounds(wid))
                 edges = _changed_edges(start, _frame_tuple(rect))
                 followers = {e: r for e, r in linked_followers(wid, start).items() if e in edges}
         ok = ax_set_frame(pid, wid, rect)
         if not ok:
             # One retry with a fresh AX element (window may have been recreated)
-            _AX_WIN_CACHE.pop(wid, None)
+            el = _AX_WIN_CACHE.pop(wid, None)
+            if el:
+                CF.CFRelease(el)
             ok = ax_set_frame(pid, wid, rect)
         if ok and followers:
             with _FOLLOW_LOCK:
                 # Use the frame we just *requested*, not a read-back: SLSGetWindowBounds lags the
-                # AX write by ~5 ms, and reading it here returned the OLD frame (followers then
-                # 'moved' to where they already were). If the app clamped our request, the
-                # read-back below catches it and we re-glue to the real frame.
+                # AX write by a few ms. If the app clamped our request, the read-back catches it
+                # and we re-glue to the real frame.
                 apply_followers(_frame_tuple(rect), followers, final=True)
-                time.sleep(0.03)
-                actual = _frame_tuple(window_bounds(wid))
+                actual = _wait_bounds_change(wid, start)
                 if any(abs(a - r) >= 1 for a, r in zip(actual, _frame_tuple(rect))):
                     apply_followers(actual, followers, final=True)
         n_linked = sum(len(v) for v in followers.values())
@@ -275,8 +289,7 @@ def snap_worker():
         if ok and raise_after:
             focus_window_async({"wid": wid, "pid": pid})
         if ok:
-            time.sleep(0.05)
-            update_thumb(wid, max_age=0.0)
+            schedule_thumb_refresh(wid, 0.05)
 
 
 def snap_window(pid: int, wid: int, side: str, visible: CGRect, raise_after: bool = False):
@@ -693,20 +706,27 @@ def companion_after_snap(snapped_wid: int, side: str, visible: CGRect):
 
 
 class SnapFootprint:
-    """Translucent preview of the target half while the cursor is in a snap zone."""
+    """Translucent preview of the target half while the cursor is in a snap zone. The panel
+    lives only while the preview is showing (built on show, closed on hide): a resident
+    panel stopped coming on screen after a display change."""
 
     def __init__(self):
+        self.panel = None
+        self.view = None
+
+    def _build(self, r: CGRect):
         panel = send(cls("NSPanel"), "alloc")
-        panel = send(panel, "initWithContentRect:styleMask:backing:defer:", vp, (CGRect, u64, u64, cbool),
-                     CGRect(CGPoint(0, 0), CGSize(10, 10)), 1 << 7, 2, False)
+        panel = send(panel, "initWithContentRect:styleMask:backing:defer:", vp, (CGRect, u64, u64, cbool), r, 1 << 7, 2, False)
         send(panel, "setLevel:", None, (i64,), 0)  # NSNormalWindowLevel: under the dragged window
         send(panel, "setCollectionBehavior:", None, (u64,), 1 | 16 | 64 | 256)
         send(panel, "setOpaque:", None, (cbool,), False)
         send(panel, "setBackgroundColor:", None, (vp,), send(cls("NSColor"), "clearColor"))
         send(panel, "setHasShadow:", None, (cbool,), False)
         send(panel, "setIgnoresMouseEvents:", None, (cbool,), True)
+        send(panel, "setAnimationBehavior:", None, (i64,), 2)
+        send(panel, "setReleasedWhenClosed:", None, (cbool,), True)
         view = send(cls("NSView"), "alloc")
-        view = send(view, "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(10, 10)))
+        view = send(view, "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), r.size))
         send(view, "setWantsLayer:", None, (cbool,), True)
         layer = send(view, "layer")
         send(layer, "setBackgroundColor:", None, (vp,), cgcolor(0.24, 0.52, 0.96, 0.22))
@@ -714,8 +734,8 @@ class SnapFootprint:
         send(layer, "setBorderWidth:", None, (f64,), 2.0)
         send(layer, "setCornerRadius:", None, (f64,), 10.0)
         send(panel, "setContentView:", None, (vp,), view)
+        send(view, "release")
         self.panel, self.view = panel, view
-        self.visible = False
 
     def show(self, rect_tl: CGRect):
         main_h = CG.CGDisplayBounds(0).size.h
@@ -724,19 +744,22 @@ class SnapFootprint:
                    CGSize(rect_tl.size.w - pad * 2, rect_tl.size.h - pad * 2))
         send(cls("CATransaction"), "begin")
         send(cls("CATransaction"), "setDisableActions:", None, (cbool,), True)
-        send(self.panel, "setFrame:display:", None, (CGRect, cbool), r, False)
-        send(self.view, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), r.size))
-        if not self.visible:
+        if self.panel is None:
+            self._build(r)
             send(self.panel, "orderFrontRegardless")
-            self.visible = True
+        else:
+            send(self.panel, "setFrame:display:", None, (CGRect, cbool), r, False)
+            send(self.view, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), r.size))
         send(cls("CATransaction"), "commit")
         send(cls("CATransaction"), "flush")
 
     def hide(self):
-        if not self.visible:
+        panel, self.panel, self.view = self.panel, None, None
+        if panel is None:
             return
-        self.visible = False
-        send(self.panel, "orderOut:", None, (vp,), None)
+        with autorelease_pool():
+            send(panel, "orderOut:", None, (vp,), None)
+            send(panel, "close")
 
 
 _FOOTPRINT: Any = None
@@ -759,7 +782,7 @@ class SnapPicker:
         self.visible = visible
         self.active = True
         _HUD.render(self.windows, self.idx, reposition=True, anchor=half_rect(visible, side))
-        warm_thumbnails_async(self.windows, on_changed=_mark_dirty)
+        warm_thumbnails_async(self.windows, on_changed=_on_thumbs_changed)
 
     def close(self):
         self.active = False
@@ -874,19 +897,14 @@ def main():
     if CFG["drag_to_edge"] or CFG["linked_resize"]:
         mask |= (1 << kCGEventLeftMouseDown) | (1 << kCGEventLeftMouseDragged) | (1 << kCGEventLeftMouseUp)
 
-    def tick_cb(timer, info):  # 50 ms: repaint picker thumbnails the background refresh changed
-        global _PICKER_DIRTY
-        if _PICKER_DIRTY and _PICKER.active:
-            _PICKER_DIRTY = False
-            _HUD.refresh_thumbnails_in_place(_PICKER.windows)
-
-    tcb = TIMER_CB(tick_cb)
-    timer = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + 0.05, 0.05, 0, 0, tcb, None)
-    CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), timer, kCFRunLoopCommonModes)
+    def on_idle_tick():
+        if not _PICKER.active and not _DRAG.active:
+            prune_thumbs({w["wid"] for w in snapshot_current_space_windows()[0]})
+            prune_ax_cache()
 
     feats = [n for n, on in (("hotkeys", HK_SNAP or HK_WIDTH), ("drag-to-edge", CFG["drag_to_edge"]),
                              ("companion", CFG["companion_snap"]), ("linked-resize", CFG["linked_resize"])) if on]
-    daemon.install("snap", mask, on_event, ready_msg=f"snap ready: {' '.join(feats)} (config {CFG_PATH})")
+    daemon.install("snap", mask, on_event, on_tick=on_idle_tick, ready_msg=f"snap ready: {' '.join(feats)} (config {CFG_PATH})")
     send(app, "run")
 
 

@@ -36,7 +36,7 @@ from macbridge import (CF, CG, CID, SL, CGPoint, CGRect, CGSize, FLAG_CMD, FLAG_
                        kCGEventKeyDown, kCGEventLeftMouseDown, kCGEventLeftMouseDragged, kCGEventLeftMouseUp,
                        kCGEventMouseMoved, kCGEventRightMouseDown, kCGEventTapDisabledByTimeout,
                        kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, log, u32, u64, vp)
-from objc import cls, define_class, nsstr, send  # noqa: E402
+from objc import autorelease_pool, cls, define_class, nsstr, send  # noqa: E402
 
 C.CDLL("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
 APPKIT = C.CDLL("/System/Library/Frameworks/AppKit.framework/AppKit")
@@ -191,9 +191,10 @@ class Overlay:
         send(panel, "orderFrontRegardless")
 
     def close(self):
-        no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))
-        send(self.panel, "orderOut:", None, (vp,), None)
-        send(self.panel, "close")
+        with autorelease_pool():
+            no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))
+            send(self.panel, "orderOut:", None, (vp,), None)
+            send(self.panel, "close")
 
     def set_selection(self, sel_tl):
         """sel_tl: global top-left rect or None (full dim)."""
@@ -429,47 +430,8 @@ def _deliver_ocr(img, sel_tl):
 
 
 # --- main-thread hop (AppKit must run on the main thread; the tap runs on its own) --------
-_MAIN_Q = []
-_MAIN_LOCK = threading.Lock()
-_MAIN_SRC: Any = None
-_MAIN_THREAD = threading.main_thread()
-
-
-def main_async(fn):
-    with _MAIN_LOCK:
-        _MAIN_Q.append(fn)
-    CF.CFRunLoopSourceSignal(_MAIN_SRC)
-    CF.CFRunLoopWakeUp(CF.CFRunLoopGetMain())
-
-
-def main_sync(fn):
-    if threading.current_thread() is _MAIN_THREAD:
-        return fn()
-    done = threading.Event()
-    box = []
-
-    def run():
-        try:
-            box.append(fn())
-        finally:
-            done.set()
-
-    main_async(run)
-    if not done.wait(2.0):
-        log("main thread did not answer within 2 s")
-    return box[0] if box else None
-
-
-def _drain_main(info):
-    while True:
-        with _MAIN_LOCK:
-            if not _MAIN_Q:
-                return
-            fn = _MAIN_Q.pop(0)
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001 - a bad callback must not kill the run loop
-            log(f"main-thread callback failed: {e!r}")
+main_async = daemon.main_async
+main_sync = daemon.main_sync
 
 
 # --- Editor -----------------------------------------------------------------------------
@@ -669,8 +631,9 @@ class Editor:
         self._end_text()
         win, self.win = self.win, None  # clear self.win before [win close] so any delegate callback sees it closed
         if win:
-            send(win, "setDelegate:", None, (vp,), None)
-            send(win, "close")
+            with autorelease_pool():
+                send(win, "setDelegate:", None, (vp,), None)
+                send(win, "close")
         self.delegate = None
         if self.image:
             CG.CGImageRelease(self.image)
@@ -1062,7 +1025,7 @@ def on_event(proxy, etype, event, refcon):
 
 
 def main():
-    global _EDITOR, _MAIN_SRC, _CURSOR_TIMER, CATransaction
+    global _EDITOR, _CURSOR_TIMER, CATransaction
     if "--check-config" in sys.argv:
         print("config OK:", CFG_PATH)
         return
@@ -1080,15 +1043,7 @@ def main():
     if SL is not None and getattr(SL, "SLSSetConnectionProperty", None):
         SL.SLSSetConnectionProperty(CID, CID, cfstr("SetsCursorInBackground"), kCFBooleanTrue)
 
-    # a run-loop source for main-thread hops (version-0 source, signalled from the tap thread)
-    class Ctx(C.Structure):
-        _fields_ = [("version", C.c_long), ("info", vp), ("retain", vp), ("release", vp), ("copyDescription", vp),
-                    ("equal", vp), ("hash", vp), ("schedule", vp), ("cancel", vp), ("perform", vp)]
-    perform = C.CFUNCTYPE(None, vp)(_drain_main)
-    ctx = Ctx(0, None, None, None, None, None, None, None, None, C.cast(perform, vp))
-    _MAIN_SRC = CF.CFRunLoopSourceCreate(None, 0, C.byref(ctx))
-    CF.CFRunLoopAddSource(CF.CFRunLoopGetMain(), _MAIN_SRC, kCFRunLoopCommonModes)
-    main._keep = (perform, ctx)  # type: ignore[attr-defined]
+    daemon.install_main_source()  # main-thread hops from the tap and worker threads
     # the crosshair watchdog: parked far in the future, pulled in by each capture
     _CURSOR_TIMER = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + 1e9, CURSOR_TICK_S, 0, 0, _CURSOR_CB, None)
     CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), _CURSOR_TIMER, kCFRunLoopCommonModes)

@@ -79,6 +79,20 @@ def ns_array(objs):
     return arr
 
 
+class autorelease_pool:
+    """`with autorelease_pool():` — drains AppKit's autoreleased objects at the end of the
+    block. A background agent that owns no windows may not run an AppKit event turn for a
+    long time, so without this a closed NSPanel lingers (off-screen) until one happens."""
+
+    def __enter__(self):
+        self.pool = send(send(cls("NSAutoreleasePool"), "alloc"), "init")
+        return self
+
+    def __exit__(self, *exc):
+        send(self.pool, "drain")
+        return False
+
+
 kCAGravityResizeAspect = vp.in_dll(QUARTZ, "kCAGravityResizeAspect")
 
 

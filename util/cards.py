@@ -9,7 +9,7 @@ import ctypes as C
 import math
 
 from macbridge import CF, CG, CGPoint, CGRect, CGSize, cbool, f64, i64, u32, u64, vp
-from objc import cls, kCAGravityResizeAspect, nsstr, send
+from objc import autorelease_pool, cls, kCAGravityResizeAspect, nsstr, send
 from windows import get_cached_thumb
 
 
@@ -34,8 +34,24 @@ def cgcolor(r, g, b, a):
 
 
 class CardHUD:
+    """Per-session thumbnail HUD: built when a switcher/picker opens (`render`) and closed +
+    released when it dismisses (`hide`). Keeping zero resident NSPanels when idle prevents
+    WindowServer display-reconfiguration rot and leaks zero subviews across sessions."""
+
     def __init__(self, max_cards=12, columns=4):
         self.max_cards, self.columns = max(1, int(max_cards)), max(1, int(columns))
+        self.panel = None
+        self.vfx = None
+        self.cards = []
+        self.frame_bl = None
+        self.card_frames = []
+        self.sel_bg = cgcolor(0.24, 0.52, 0.96, 0.34)
+        self.sel_border = cgcolor(0.36, 0.66, 1.0, 0.95)
+        self.idle_bg = cgcolor(1.0, 1.0, 1.0, 0.04)
+        self.idle_border = cgcolor(1.0, 1.0, 1.0, 0.10)
+        self.thumb_well_bg = cgcolor(0.0, 0.0, 0.0, 0.36)
+
+    def _build(self):
         init_frame = CGRect(CGPoint(0, 0), CGSize(640, 240))
         panel = send(cls("NSPanel"), "alloc")
         panel = send(panel, "initWithContentRect:styleMask:backing:defer:", vp, (CGRect, u64, u64, cbool), init_frame, 1 << 7, 2, False)
@@ -45,6 +61,7 @@ class CardHUD:
         send(panel, "setOpaque:", None, (cbool,), False)
         send(panel, "setBackgroundColor:", None, (vp,), send(cls("NSColor"), "clearColor"))
         send(panel, "setHasShadow:", None, (cbool,), True)
+        send(panel, "setReleasedWhenClosed:", None, (cbool,), True)
         self.panel = panel
 
         vfx = send(cls("NSVisualEffectView"), "alloc")
@@ -59,13 +76,8 @@ class CardHUD:
         send(vlayer, "setBorderWidth:", None, (f64,), 1.0)
         send(vlayer, "setBorderColor:", None, (vp,), cgcolor(1.0, 1.0, 1.0, 0.16))
         send(panel, "setContentView:", None, (vp,), vfx)
+        send(vfx, "release")
         self.vfx = vfx
-
-        self.sel_bg = cgcolor(0.24, 0.52, 0.96, 0.34)
-        self.sel_border = cgcolor(0.36, 0.66, 1.0, 0.95)
-        self.idle_bg = cgcolor(1.0, 1.0, 1.0, 0.04)
-        self.idle_border = cgcolor(1.0, 1.0, 1.0, 0.10)
-        self.thumb_well_bg = cgcolor(0.0, 0.0, 0.0, 0.36)
 
         title_font = send(cls("NSFont"), "systemFontOfSize:weight:", vp, (f64, f64), 13.0, 0.35)
         self.cards = []
@@ -82,6 +94,7 @@ class CardHUD:
             iv = send(iv, "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(THUMB_PAD, CARD_H - 31), CGSize(20, 20)))
             send(iv, "setImageScaling:", None, (u64,), 3)
             send(card, "addSubview:", None, (vp,), iv)
+            send(iv, "release")
 
             tf = send(cls("NSTextField"), "labelWithString:", vp, (vp,), nsstr(""))
             send(tf, "setFrame:", None, (CGRect,), CGRect(CGPoint(THUMB_PAD + 26, CARD_H - 30), CGSize(CARD_W - THUMB_PAD * 2 - 26, 18)))
@@ -100,8 +113,10 @@ class CardHUD:
             send(tlayer, "setBackgroundColor:", None, (vp,), self.thumb_well_bg)
             send(tlayer, "setContentsGravity:", None, (vp,), kCAGravityResizeAspect)
             send(card, "addSubview:", None, (vp,), tv)
+            send(tv, "release")
 
             send(vfx, "addSubview:", None, (vp,), card)
+            send(card, "release")
             self.cards.append((card, clayer, iv, tf, tlayer))
 
     def render(self, windows, selected_idx: int, reposition: bool = False, anchor=None):
@@ -109,6 +124,9 @@ class CardHUD:
         if total == 0:
             self.hide()
             return
+        if self.panel is None:
+            self._build()
+            reposition = True
         max_cols = self.columns
         if anchor is not None:
             max_cols = max(1, min(self.columns, int((anchor.size.w - OUTER_PAD * 2 + CARD_GAP) // (CARD_W + CARD_GAP))))
@@ -173,6 +191,8 @@ class CardHUD:
         send(cls("CATransaction"), "flush")
 
     def refresh_thumbnails_in_place(self, windows):
+        if self.panel is None:
+            return
         total = min(len(windows), self.max_cards)
         send(cls("CATransaction"), "begin")
         send(cls("CATransaction"), "setDisableActions:", None, (cbool,), True)
@@ -184,11 +204,20 @@ class CardHUD:
         send(cls("CATransaction"), "commit")
 
     def hide(self):
-        send(cls("CATransaction"), "begin")
-        send(cls("CATransaction"), "setDisableActions:", None, (cbool,), True)
-        send(self.panel, "orderOut:", None, (vp,), None)
-        send(cls("CATransaction"), "commit")
-        send(cls("CATransaction"), "flush")
+        panel, self.panel = self.panel, None
+        self.cards = []
+        self.vfx = None
+        self.frame_bl = None
+        self.card_frames = []
+        if panel is None:
+            return
+        with autorelease_pool():
+            send(cls("CATransaction"), "begin")
+            send(cls("CATransaction"), "setDisableActions:", None, (cbool,), True)
+            send(panel, "orderOut:", None, (vp,), None)
+            send(cls("CATransaction"), "commit")
+            send(cls("CATransaction"), "flush")
+            send(panel, "close")
 
     def card_at(self, pt_tl: CGPoint):
         """Card index under a top-left-coords point; -1 = on panel but no card; None = outside."""

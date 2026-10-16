@@ -18,8 +18,10 @@ launchd restarts us clean.
 
 import ctypes as C
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 
 from macbridge import (AX, CF, CG, TAP_CB, TIMER_CB, cf_dict, kCFBooleanTrue, kCFRunLoopCommonModes,
@@ -27,6 +29,8 @@ from macbridge import (AX, CF, CG, TAP_CB, TIMER_CB, cf_dict, kCFBooleanTrue, kC
 
 _TAP = None
 _REFS = []  # keep ctypes callbacks alive for the process lifetime
+_MAIN_Q: queue.SimpleQueue = queue.SimpleQueue()
+_MAIN_SRC = None
 
 
 def accessibility_trusted(prompt=False):
@@ -72,11 +76,69 @@ def respawn_if_fresh_process_is_allowed(service):
     return False
 
 
+def _drain_main(info):
+    while True:
+        try:
+            fn = _MAIN_Q.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            fn()
+        except Exception as e:
+            log(f"main-thread callback failed: {e!r}")
+
+
+def install_main_source():
+    """Install a version-0 CFRunLoopSource on the main run loop so worker/tap threads can
+    schedule work via `main_async`/`main_sync` with zero idle timer wakeups."""
+    global _MAIN_SRC
+    if _MAIN_SRC is not None:
+        return
+
+    class Ctx(C.Structure):
+        _fields_ = [("version", C.c_long), ("info", vp), ("retain", vp), ("release", vp), ("copyDescription", vp),
+                    ("equal", vp), ("hash", vp), ("schedule", vp), ("cancel", vp), ("perform", vp)]
+
+    perform = C.CFUNCTYPE(None, vp)(_drain_main)
+    ctx = Ctx(0, None, None, None, None, None, None, None, None, C.cast(perform, vp))
+    _REFS.extend([perform, ctx])
+    _MAIN_SRC = CF.CFRunLoopSourceCreate(None, 0, C.byref(ctx))
+    CF.CFRunLoopAddSource(CF.CFRunLoopGetMain(), _MAIN_SRC, kCFRunLoopCommonModes)
+
+
+def main_async(fn):
+    """Run `fn()` on the main thread via the CFRunLoopSource (zero polling)."""
+    _MAIN_Q.put(fn)
+    if _MAIN_SRC:
+        CF.CFRunLoopSourceSignal(_MAIN_SRC)
+        CF.CFRunLoopWakeUp(CF.CFRunLoopGetMain())
+
+
+def main_sync(fn, timeout=2.0):
+    """Run `fn()` on the main thread and return its result (inline if already on main)."""
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    done = threading.Event()
+    box = [None]
+
+    def run_it():
+        try:
+            box[0] = fn()
+        finally:
+            done.set()
+
+    main_async(run_it)
+    if not done.wait(timeout):
+        log("main_sync timed out waiting for main loop")
+    return box[0]
+
+
 def install(name, mask, callback, on_tick=None, tick_s=5.0, ready_msg=None):
-    """Create the tap and the health timer on the current (main) run loop without blocking.
+    """Create the tap, main-loop source, and 5 s health timer without blocking.
     `callback(proxy, etype, event, refcon)` is the raw CGEventTapCallBack; `on_tick()` runs
     every `tick_s` on the main loop. Daemons that drive AppKit call this, then `[NSApp run]`."""
     global _TAP
+    install_main_source()
     wait_for_accessibility(name)
     cb = TAP_CB(callback)
     _REFS.append(cb)

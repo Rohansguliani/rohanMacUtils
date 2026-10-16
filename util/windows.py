@@ -74,6 +74,7 @@ def app_meta(pid: int):
 
 _THUMB_LOCK = threading.Lock()
 _THUMB_CACHE = {}  # wid -> (cg_image_ptr: int, captured_monotonic: float)
+_REFRESH_TIMERS: dict[int, threading.Timer] = {}
 
 
 def get_cached_thumb(wid: int):
@@ -115,13 +116,50 @@ def update_thumb(wid: int, max_age: float = 1.2) -> bool:
     return True
 
 
-def prune_thumbs(live_wids: set[int]):
+def schedule_thumb_refresh(wid: int, delay: float = 0.06):
+    """Coalesce delayed single-window thumbnail refreshes without blocking worker threads."""
+    def _run():
+        with _THUMB_LOCK:
+            _REFRESH_TIMERS.pop(wid, None)
+        update_thumb(wid, max_age=0.0)
+
     with _THUMB_LOCK:
-        dead = [w for w in _THUMB_CACHE if w not in live_wids]
+        old = _REFRESH_TIMERS.pop(wid, None)
+        if old:
+            old.cancel()
+        t = threading.Timer(delay, _run)
+        t.daemon = True
+        _REFRESH_TIMERS[wid] = t
+        t.start()
+
+
+def prune_thumbs(live_wids: set[int]):
+    """Idle-time cleanup for a long-running daemon: thumbnails of windows that left the Space,
+    MRU/watch entries and app icons of windows and apps that no longer exist."""
+    global _WATCHED_WIDS
+    wcid = i32(0)
+    with _MRU_LOCK:
+        mru = list(_MRU)
+    still_open = {w for w in (_WATCHED_WIDS | set(mru) | live_wids) if SL.SLSGetWindowOwner(CID, w, C.byref(wcid)) == 0}
+    keep_thumbs = live_wids & still_open
+    with _THUMB_LOCK:
+        dead = [w for w in _THUMB_CACHE if w not in keep_thumbs]
         for w in dead:
             img, _ = _THUMB_CACHE.pop(w)
             if img:
                 CF.CFRelease(img)
+    with _MRU_LOCK:
+        _MRU[:] = [w for w in _MRU if w in still_open]
+    if _WATCHED_WIDS != still_open:
+        _WATCHED_WIDS = still_open
+        if _WATCHED_WIDS:
+            arr = (u32 * len(_WATCHED_WIDS))(*_WATCHED_WIDS)
+            SL.SLSRequestNotificationsForWindows(CID, arr, len(_WATCHED_WIDS))
+    dead_pids = [pid for pid in list(_APP_META) if not send(cls("NSRunningApplication"), "runningApplicationWithProcessIdentifier:", vp, (i32,), pid)]
+    for pid in dead_pids:
+        _, icon, _ = _APP_META.pop(pid, ("", None, True))
+        if icon:
+            send(icon, "release")
 
 
 # ---------------------------------------------------------------------------
@@ -336,9 +374,7 @@ def focus_window_async(win):
             SL_SET_FRONT(C.byref(psn), wid, 0x200)
             make_key_window_record(psn, wid)
         ax_raise_or_close(pid, wid, "AXRaise")
-        # Refresh thumbnail of the newly focused window once it settles
-        time.sleep(0.08)
-        update_thumb(wid, max_age=0.0)
+        schedule_thumb_refresh(wid, 0.06)
 
     threading.Thread(target=worker, daemon=True).start()
 

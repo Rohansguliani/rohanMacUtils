@@ -30,12 +30,12 @@ import config  # noqa: E402
 import daemon  # noqa: E402
 import windows  # noqa: E402
 from cards import CardHUD  # noqa: E402
-from macbridge import (CF, CG, CID, SL, TIMER_CB, FLAG_SHIFT, MODIFIER_MASK, cbool, i64, kCFRunLoopCommonModes,  # noqa: E402
+from macbridge import (CG, CID, SL, FLAG_SHIFT, MODIFIER_MASK, cbool, i64,  # noqa: E402
                        kCGEventFlagsChanged, kCGEventKeyDown, kCGEventTapDisabledByTimeout,
                        kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, log)
 from objc import cls, send  # noqa: E402
 from windows import (ax_raise_or_close, focus_window_async, get_cached_thumb, ordered_windows_for_session,  # noqa: E402
-                     prune_thumbs, recent_mru, update_thumb, warm_thumbnails_async)
+                     prune_thumbs, recent_mru, snapshot_current_space_windows, update_thumb, warm_thumbnails_async)
 
 DEFAULTS = {
     "switch_windows": "opt+tab",       # all windows on the current Space
@@ -56,14 +56,10 @@ _WINDOWS = []
 _IDX = 0
 _APP_ONLY = False
 _MODS = 0  # modifier bits held when summoned; releasing any of them commits
-_DIRTY = False  # a background thumbnail refresh changed a card we are showing
 
 
-def _mark_dirty():
-    global _DIRTY
-    if _ACTIVE:
-        _DIRTY = True
-        CF.CFRunLoopWakeUp(CF.CFRunLoopGetMain())
+def _on_thumbs_changed():
+    daemon.main_async(lambda: _ACTIVE and _HUD.refresh_thumbnails_in_place(_WINDOWS))
 
 
 def _open(wins, app_only, mods, backwards):
@@ -72,7 +68,7 @@ def _open(wins, app_only, mods, backwards):
     _APP_ONLY, _MODS, _WINDOWS = app_only, mods, wins
     _IDX = 0 if len(wins) == 1 else ((len(wins) - 1) if backwards else 1)
     _HUD.render(_WINDOWS, _IDX, reposition=True)
-    warm_thumbnails_async(wins, on_changed=_mark_dirty)
+    warm_thumbnails_async(wins, on_changed=_on_thumbs_changed)
 
 
 def _close(commit):
@@ -127,7 +123,7 @@ def on_event(proxy, etype, event, refcon):
             _APP_ONLY = not _APP_ONLY
             _WINDOWS, _IDX = wins, min(_IDX, len(wins) - 1)
             _HUD.render(_WINDOWS, _IDX, reposition=True)
-            warm_thumbnails_async(wins, on_changed=_mark_dirty)
+            warm_thumbnails_async(wins, on_changed=_on_thumbs_changed)
     elif key == KEY_W and n:
         w = _WINDOWS.pop(_IDX)
         threading.Thread(target=ax_raise_or_close, args=(w["pid"], w["wid"], "AXClose"), daemon=True).start()
@@ -195,24 +191,14 @@ def main():
         update_thumb(w["wid"], max_age=0.0)
     windows.start_focus_tracking()
 
-    tick_n = [0]
-
-    def tick_cb(timer, info):  # 50 ms: repaint changed thumbnails; every 2.5 s idle: pre-warm + prune
-        global _DIRTY
-        if _DIRTY and _ACTIVE:
-            _DIRTY = False
-            _HUD.refresh_thumbnails_in_place(_WINDOWS)
-        tick_n[0] += 1
-        if tick_n[0] % 50 == 0 and not _ACTIVE:
-            cur = ordered_windows_for_session(app_only=False)
+    def on_idle_tick():  # every 5 s while idle: drop dead entries, keep thumbnails fresh (SkyLight only, no AX)
+        if not _ACTIVE:
+            cur = snapshot_current_space_windows()[0]
             prune_thumbs({w["wid"] for w in cur} | set(recent_mru()))
             warm_thumbnails_async(cur, max_age=2.0)
 
-    tcb = TIMER_CB(tick_cb)
-    timer = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + 0.05, 0.05, 0, 0, tcb, None)
-    CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), timer, kCFRunLoopCommonModes)
-
     daemon.install("alttab", (1 << kCGEventKeyDown) | (1 << kCGEventFlagsChanged), on_event,
+                   on_tick=on_idle_tick,
                    ready_msg=f"alttab ready: {CFG['switch_windows']} / {CFG['switch_app_windows'] or 'off'}"
                              f" ({len(wins)} windows on current Space; config {CFG_PATH})")
     send(app, "run")
