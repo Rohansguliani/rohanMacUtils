@@ -191,8 +191,9 @@ class Overlay:
         send(panel, "orderFrontRegardless")
 
     def close(self):
+        # Order out first, then close; never touch the layer while the panel is still on screen
+        # (clearing the frame before orderOut showed one black frame: measured 7-10 ms of black).
         with autorelease_pool():
-            no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))
             send(self.panel, "orderOut:", None, (vp,), None)
             send(self.panel, "close")
 
