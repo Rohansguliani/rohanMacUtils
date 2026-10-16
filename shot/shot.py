@@ -32,10 +32,10 @@ import config  # noqa: E402
 import daemon  # noqa: E402
 import imaging  # noqa: E402
 from macbridge import (CF, CG, CID, SL, CGPoint, CGRect, CGSize, FLAG_CMD, FLAG_SHIFT, MODIFIER_MASK, TIMER_CB, cbool,  # noqa: E402
-                       cf_to_i64, cfstr, f64, i64, kCFBooleanTrue, kCFRunLoopCommonModes, kCGEventFlagsChanged,
+                       cfstr, f64, i64, kCFBooleanTrue, kCFRunLoopCommonModes, kCGEventFlagsChanged,
                        kCGEventKeyDown, kCGEventLeftMouseDown, kCGEventLeftMouseDragged, kCGEventLeftMouseUp,
                        kCGEventMouseMoved, kCGEventRightMouseDown, kCGEventTapDisabledByTimeout,
-                       kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, kCGWindowListOptionOnScreenOnly, K_WIN_NUMBER, log, u32, u64, vp)
+                       kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, log, u32, u64, vp)
 from objc import cls, define_class, nsstr, send  # noqa: E402
 
 C.CDLL("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
@@ -110,37 +110,6 @@ def display_for_point(x, y):
     return did.value if cnt.value else CG.CGMainDisplayID()
 
 
-def window_on_screen(win):
-    """Ask the window server, not AppKit: once, after a display change, orderFront on a
-    long-lived panel did nothing while AppKit still considered it visible. Ordering is
-    flushed at the end of a run-loop turn, so ask a little later, never right after."""
-    wid = send(win, "windowNumber", i64)
-    arr = CG.CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0)
-    found = False
-    for i in range(CF.CFArrayGetCount(arr)):
-        if cf_to_i64(CF.CFDictionaryGetValue(CF.CFArrayGetValueAtIndex(arr, i), K_WIN_NUMBER)) == wid:
-            found = True
-            break
-    CF.CFRelease(arr)
-    return found
-
-
-_PENDING: dict = {}  # one-shot timer callbacks, alive until they fire (ctypes callbacks are unhashable: keyed by id)
-
-
-def after(delay_s, fn):
-    """Run fn on the main loop after delay_s."""
-    def fire(timer, info):
-        _PENDING.pop(id(cb), None)
-        fn()
-
-    cb = TIMER_CB(fire)
-    _PENDING[id(cb)] = cb
-    t = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + delay_s, 0, 0, 0, cb, None)
-    CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), t, kCFRunLoopCommonModes)
-    CF.CFRelease(t)  # the run loop holds it until it fires
-
-
 def cocoa_rect(tl: CGRect):
     """Top-left global rect -> Cocoa bottom-left global rect."""
     main_h = CG.CGDisplayBounds(CG.CGMainDisplayID()).size.h
@@ -155,15 +124,16 @@ def norm_rect(a: CGPoint, b: CGPoint):
 
 # --- The selection overlay ------------------------------------------------------------
 class Overlay:
-    """One borderless panel per capture, covering the display under the cursor. Built
-    once, reused: showing it is setContents (the frozen frame) + setFrame + orderFront.
+    """One borderless panel per capture, covering the display under the cursor; built on
+    hotkey and closed on finish/cancel (~0.6 ms — keeping one alive across a display change
+    left a panel that WindowServer would no longer put on screen).
 
     The frozen frame IS the overlay's content: whatever happens underneath (video, a
     blinking caret, a notification) stays out of the picture and out of the selection."""
 
-    def __init__(self):
+    def __init__(self, frame_tl: CGRect, frame_img, scale: float):
         panel = send(send(cls("NSPanel"), "alloc"), "initWithContentRect:styleMask:backing:defer:", vp,
-                     (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(100, 100)), NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False)
+                     (CGRect, u64, u64, cbool), cocoa_rect(frame_tl), NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False)
         send(panel, "setLevel:", None, (i64,), kCGScreenSaverWindowLevel)
         send(panel, "setCollectionBehavior:", None, (u64,), 1 | 16 | 64 | 256)  # all Spaces, stationary, ignores cycle, full-screen aux
         send(panel, "setOpaque:", None, (cbool,), True)
@@ -174,12 +144,14 @@ class Overlay:
         send(panel, "setIgnoresMouseEvents:", None, (cbool,), False)
         send(panel, "setAcceptsMouseMovedEvents:", None, (cbool,), True)
         send(panel, "setAnimationBehavior:", None, (i64,), 2)  # NSWindowAnimationBehaviorNone
+        send(panel, "setReleasedWhenClosed:", None, (cbool,), True)
         self.panel = panel
-        view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(100, 100)))
+        view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), frame_tl.size))
         send(view, "setWantsLayer:", None, (cbool,), True)
         root = send(view, "layer")
         send(root, "setBackgroundColor:", None, (vp,), cgcolor(0, 0, 0, 1.0))
         send(panel, "setContentView:", None, (vp,), view)
+        send(view, "release")
         self.frozen = send(cls("CALayer"), "layer")  # the captured display
         send(self.frozen, "setMagnificationFilter:", None, (vp,), nsstr("nearest"))
         send(self.frozen, "setMinificationFilter:", None, (vp,), nsstr("nearest"))
@@ -206,30 +178,22 @@ class Overlay:
         send(self.label, "setContentsScale:", None, (f64,), 2.0)
         send(root, "addSublayer:", None, (vp,), self.label)
         self.root = root
-        self.shown = False
-        self.frame_tl: Any = None
-        self.h = 0.0
-
-    def show(self, frame_tl: CGRect, frame_img, scale: float):
         self.frame_tl = frame_tl
         self.h = frame_tl.size.h
 
-        def build():
-            send(self.panel, "setFrame:display:", None, (CGRect, cbool), cocoa_rect(frame_tl), False)
+        def populate():
             send(self.frozen, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), frame_tl.size))
             send(self.frozen, "setContentsScale:", None, (f64,), scale)
             send(self.frozen, "setContents:", None, (vp,), frame_img)
             self.set_selection(None)
 
-        no_anim(build)
-        send(self.panel, "orderFrontRegardless")
-        self.shown = True
+        no_anim(populate)
+        send(panel, "orderFrontRegardless")
 
-    def hide(self):
-        if self.shown:
-            send(self.panel, "orderOut:", None, (vp,), None)
-            no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))  # drop the 35 MB frame
-            self.shown = False
+    def close(self):
+        no_anim(lambda: send(self.frozen, "setContents:", None, (vp,), None))
+        send(self.panel, "orderOut:", None, (vp,), None)
+        send(self.panel, "close")
 
     def set_selection(self, sel_tl):
         """sel_tl: global top-left rect or None (full dim)."""
@@ -300,7 +264,7 @@ def queue_refresh():
 
 def _refresh_overlay():
     S.refresh_queued = False
-    if not S.active:
+    if not S.active or _OVERLAY is None:
         return
     set_crosshair()
     if S.dragging and S.anchor is not None:
@@ -333,38 +297,20 @@ def begin(mode):
 
 
 def _show_overlay():
+    global _OVERLAY
+    if not S.active:
+        return
+    if _OVERLAY is not None:
+        _OVERLAY.close()
+        _OVERLAY = None
     t0 = time.perf_counter()
-    _OVERLAY.show(S.frame_tl, S.frame, S.scale)
+    _OVERLAY = Overlay(S.frame_tl, S.frame, S.scale)
+    if S.dragging and S.anchor is not None:
+        _OVERLAY.set_selection(norm_rect(S.anchor, S.cur))
     t1 = time.perf_counter()
     set_crosshair()
     CF.CFRunLoopTimerSetNextFireDate(_CURSOR_TIMER, CF.CFAbsoluteTimeGetCurrent() + CURSOR_TICK_S)
     trace(f"overlay shown in {(t1 - t0) * 1e3:.1f} ms (+{(time.perf_counter() - t1) * 1e3:.1f} ms cursor), {(time.perf_counter() - S.t_hotkey) * 1e3:.1f} ms after the hotkey")
-    after(VERIFY_AFTER_S, _verify_overlay)
-
-
-VERIFY_AFTER_S = 0.1  # window ordering is asynchronous; one run-loop turn is plenty, this is generous
-
-
-def _verify_overlay(rebuilt=False):
-    """The resident panel once stopped coming on screen (after a display change, in a process
-    that had run for an hour): captures still worked, the user saw nothing. If the window
-    server does not list the overlay, rebuild it once and show again; log it either way."""
-    global _OVERLAY
-    if not S.active or window_on_screen(_OVERLAY.panel):
-        return
-    if rebuilt:
-        log("overlay still not on screen after the rebuild")
-        return
-    log("overlay did not come on screen; rebuilding the panel")
-    old = _OVERLAY
-    old.hide()
-    _OVERLAY = Overlay()
-    _OVERLAY.show(S.frame_tl, S.frame, S.scale)
-    if S.dragging and S.anchor is not None:
-        _OVERLAY.set_selection(norm_rect(S.anchor, S.cur))
-    set_crosshair()
-    send(old.panel, "close")
-    after(VERIFY_AFTER_S, lambda: _verify_overlay(rebuilt=True))
 
 
 _CROSSHAIR: Any = None
@@ -400,8 +346,11 @@ def cancel():
 
 
 def _teardown():
+    global _OVERLAY
     CF.CFRunLoopTimerSetNextFireDate(_CURSOR_TIMER, CF.CFAbsoluteTimeGetCurrent() + 1e9)
-    _OVERLAY.hide()
+    if _OVERLAY is not None:
+        _OVERLAY.close()
+        _OVERLAY = None
     send(send(cls("NSCursor"), "arrowCursor"), "set")
     if S.frame:
         CG.CGImageRelease(S.frame)
@@ -568,7 +517,7 @@ class Editor:
                    (CGRect, u64, u64, cbool), CGRect(CGPoint(0, 0), CGSize(w, h + BAR_H)), style, NSBackingStoreBuffered, False)
         send(win, "setTitle:", None, (vp,), nsstr("shot"))
         send(win, "setLevel:", None, (i64,), 3)  # floating
-        send(win, "setReleasedWhenClosed:", None, (cbool,), False)
+        send(win, "setReleasedWhenClosed:", None, (cbool,), True)
         send(win, "setCollectionBehavior:", None, (u64,), 1 | 256)
         send(win, "setAnimationBehavior:", None, (i64,), 2)
         view = send(send(cls("NSView"), "alloc"), "initWithFrame:", vp, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h + BAR_H)))
@@ -613,6 +562,7 @@ class Editor:
             x += bw + BTN_GAP
         self.bar_min_w = x + BTN_PAD
         send(win, "setContentView:", None, (vp,), view)
+        send(view, "release")
         self.win, self.view, self.root = win, view, root
         self._paint_buttons()
         ed = self
@@ -621,7 +571,7 @@ class Editor:
             ed._layout()
 
         def should_close(_self, _cmd, _sender):
-            ed.close()  # the red button: hide and drop the shot like Esc does, never destroy the window
+            ed.close()
             return False
 
         k = define_class("ShotEditorDelegate", "NSObject", {
@@ -643,11 +593,10 @@ class Editor:
         self.tool = tool
         no_anim(self._paint_buttons)
 
-    def open(self, img, sel_tl, scale, verify=True):
+    def open(self, img, sel_tl, scale):
         self.close()
         w, h = sel_tl.size.w, sel_tl.size.h
-        if not self.win:
-            self._build(w, h)
+        self._build(w, h)
         self.image, self.sel_tl, self.scale = img, sel_tl, scale
         self.items = []
         self.tool = "pen"
@@ -663,8 +612,6 @@ class Editor:
             send(self.img_layer, "setContents:", None, (vp,), img)
             send(self.img_layer, "setContentsScale:", None, (f64,), scale)
             send(self.ann, "setFrame:", None, (CGRect,), CGRect(CGPoint(0, 0), CGSize(w, h)))
-            for s in list(self._sublayers(self.ann)):
-                send(s, "removeFromSuperlayer")
             self._paint_buttons()
             # opens tight around the shot; any edge can be pulled out for drawing room, never in
             W, H = w + self.slack, h + BAR_H
@@ -683,22 +630,6 @@ class Editor:
         self._activate()
         self.open_ = True
         self.focused = True  # owns the keyboard until a click lands outside the window
-        if verify:
-            after(VERIFY_AFTER_S, self._verify_shown)
-
-    def _verify_shown(self):
-        """Same guard as the overlay: a long-lived window that the window server will not
-        order in gets rebuilt once, keeping the capture."""
-        if not self.open_ or window_on_screen(self.win):
-            return
-        log("editor window did not come on screen; rebuilding it")
-        img, sel_tl, scale = self.image, self.sel_tl, self.scale
-        self.image = None  # close() must not release the capture we are about to reopen
-        self.close()
-        send(self.win, "close")
-        self.win = None
-        self.open(img, sel_tl, scale, verify=False)
-        after(VERIFY_AFTER_S, lambda: self.open_ and not window_on_screen(self.win) and log("editor window still not on screen after the rebuild"))
 
     def _layout(self):
         """Fit canvas, shot and toolbar to the current window. Across a resize the shot keeps
@@ -730,18 +661,17 @@ class Editor:
         self.focused = True
         self._activate()
 
-    def _sublayers(self, layer):
-        subs = send(layer, "sublayers")
-        n = CF.CFArrayGetCount(subs) if subs else 0
-        return [CF.CFArrayGetValueAtIndex(subs, i) for i in range(n)]
-
     def close(self):
         if not self.open_:
             return
         self.open_ = False
         self.focused = False
         self._end_text()
-        send(self.win, "orderOut:", None, (vp,), None)
+        win, self.win = self.win, None  # clear self.win before [win close] so any delegate callback sees it closed
+        if win:
+            send(win, "setDelegate:", None, (vp,), None)
+            send(win, "close")
+        self.delegate = None
         if self.image:
             CG.CGImageRelease(self.image)
             self.image = None
@@ -1132,7 +1062,7 @@ def on_event(proxy, etype, event, refcon):
 
 
 def main():
-    global _OVERLAY, _EDITOR, _MAIN_SRC, _CURSOR_TIMER, CATransaction
+    global _EDITOR, _MAIN_SRC, _CURSOR_TIMER, CATransaction
     if "--check-config" in sys.argv:
         print("config OK:", CFG_PATH)
         return
@@ -1163,7 +1093,6 @@ def main():
     _CURSOR_TIMER = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + 1e9, CURSOR_TICK_S, 0, 0, _CURSOR_CB, None)
     CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), _CURSOR_TIMER, kCFRunLoopCommonModes)
 
-    _OVERLAY = Overlay()
     _EDITOR = Editor()
     # First CGWindowListCreateImage in a process costs ~40 ms (pipeline setup); every later
     # one is ~1 ms. Pay it now, not on the first hotkey.
