@@ -35,7 +35,7 @@ from macbridge import (CF, CG, CID, SL, CGPoint, CGRect, CGSize, FLAG_CMD, FLAG_
                        cf_to_i64, cfstr, f64, i64, kCFBooleanTrue, kCFRunLoopCommonModes, kCGEventFlagsChanged,
                        kCGEventKeyDown, kCGEventLeftMouseDown, kCGEventLeftMouseDragged, kCGEventLeftMouseUp,
                        kCGEventMouseMoved, kCGEventRightMouseDown, kCGEventTapDisabledByTimeout,
-                       kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, log, u32, u64, vp)
+                       kCGEventTapDisabledByUserInput, kCGKeyboardEventKeycode, kCGWindowListOptionOnScreenOnly, K_WIN_NUMBER, log, u32, u64, vp)
 from objc import cls, define_class, nsstr, send  # noqa: E402
 
 C.CDLL("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
@@ -108,6 +108,37 @@ def display_for_point(x, y):
     did, cnt = u32(0), u32(0)
     CG.CGGetDisplaysWithPoint(CGPoint(x, y), 1, C.byref(did), C.byref(cnt))
     return did.value if cnt.value else CG.CGMainDisplayID()
+
+
+def window_on_screen(win):
+    """Ask the window server, not AppKit: once, after a display change, orderFront on a
+    long-lived panel did nothing while AppKit still considered it visible. Ordering is
+    flushed at the end of a run-loop turn, so ask a little later, never right after."""
+    wid = send(win, "windowNumber", i64)
+    arr = CG.CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0)
+    found = False
+    for i in range(CF.CFArrayGetCount(arr)):
+        if cf_to_i64(CF.CFDictionaryGetValue(CF.CFArrayGetValueAtIndex(arr, i), K_WIN_NUMBER)) == wid:
+            found = True
+            break
+    CF.CFRelease(arr)
+    return found
+
+
+_PENDING: dict = {}  # one-shot timer callbacks, alive until they fire (ctypes callbacks are unhashable: keyed by id)
+
+
+def after(delay_s, fn):
+    """Run fn on the main loop after delay_s."""
+    def fire(timer, info):
+        _PENDING.pop(id(cb), None)
+        fn()
+
+    cb = TIMER_CB(fire)
+    _PENDING[id(cb)] = cb
+    t = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + delay_s, 0, 0, 0, cb, None)
+    CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), t, kCFRunLoopCommonModes)
+    CF.CFRelease(t)  # the run loop holds it until it fires
 
 
 def cocoa_rect(tl: CGRect):
@@ -308,6 +339,32 @@ def _show_overlay():
     set_crosshair()
     CF.CFRunLoopTimerSetNextFireDate(_CURSOR_TIMER, CF.CFAbsoluteTimeGetCurrent() + CURSOR_TICK_S)
     trace(f"overlay shown in {(t1 - t0) * 1e3:.1f} ms (+{(time.perf_counter() - t1) * 1e3:.1f} ms cursor), {(time.perf_counter() - S.t_hotkey) * 1e3:.1f} ms after the hotkey")
+    after(VERIFY_AFTER_S, _verify_overlay)
+
+
+VERIFY_AFTER_S = 0.1  # window ordering is asynchronous; one run-loop turn is plenty, this is generous
+
+
+def _verify_overlay(rebuilt=False):
+    """The resident panel once stopped coming on screen (after a display change, in a process
+    that had run for an hour): captures still worked, the user saw nothing. If the window
+    server does not list the overlay, rebuild it once and show again; log it either way."""
+    global _OVERLAY
+    if not S.active or window_on_screen(_OVERLAY.panel):
+        return
+    if rebuilt:
+        log("overlay still not on screen after the rebuild")
+        return
+    log("overlay did not come on screen; rebuilding the panel")
+    old = _OVERLAY
+    old.hide()
+    _OVERLAY = Overlay()
+    _OVERLAY.show(S.frame_tl, S.frame, S.scale)
+    if S.dragging and S.anchor is not None:
+        _OVERLAY.set_selection(norm_rect(S.anchor, S.cur))
+    set_crosshair()
+    send(old.panel, "close")
+    after(VERIFY_AFTER_S, lambda: _verify_overlay(rebuilt=True))
 
 
 _CROSSHAIR: Any = None
@@ -586,7 +643,7 @@ class Editor:
         self.tool = tool
         no_anim(self._paint_buttons)
 
-    def open(self, img, sel_tl, scale):
+    def open(self, img, sel_tl, scale, verify=True):
         self.close()
         w, h = sel_tl.size.w, sel_tl.size.h
         if not self.win:
@@ -626,6 +683,22 @@ class Editor:
         self._activate()
         self.open_ = True
         self.focused = True  # owns the keyboard until a click lands outside the window
+        if verify:
+            after(VERIFY_AFTER_S, self._verify_shown)
+
+    def _verify_shown(self):
+        """Same guard as the overlay: a long-lived window that the window server will not
+        order in gets rebuilt once, keeping the capture."""
+        if not self.open_ or window_on_screen(self.win):
+            return
+        log("editor window did not come on screen; rebuilding it")
+        img, sel_tl, scale = self.image, self.sel_tl, self.scale
+        self.image = None  # close() must not release the capture we are about to reopen
+        self.close()
+        send(self.win, "close")
+        self.win = None
+        self.open(img, sel_tl, scale, verify=False)
+        after(VERIFY_AFTER_S, lambda: self.open_ and not window_on_screen(self.win) and log("editor window still not on screen after the rebuild"))
 
     def _layout(self):
         """Fit canvas, shot and toolbar to the current window. Across a resize the shot keeps
