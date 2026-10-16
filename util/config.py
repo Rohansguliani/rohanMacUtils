@@ -7,10 +7,14 @@ silently run with a half-parsed config.
 Hotkey strings look like "opt+left", "opt+shift+=", "ctrl+cmd+right". Modifier names:
 shift ctrl/control opt/option/alt cmd/command. Key names: left right up down tab esc
 return space minus/- equal/= plus/+ a-z 0-9 f1-f20 missioncontrol.
+
+Two names resolve to whatever the user has bound in System Settings > Keyboard > Shortcuts
+> Mission Control at daemon start: "spaceleft" / "spaceright" (Move left/right a space).
 """
 
 import json
 import os
+import plistlib
 
 from macbridge import FLAG_NAMES, MODIFIER_MASK  # noqa: E402
 
@@ -31,18 +35,47 @@ KEYCODES = {
 }
 
 
+# com.apple.symbolichotkeys ids -> macOS default binding
+SYMBOLIC_HOTKEYS = {"spaceleft": (79, "ctrl+left"), "spaceright": (81, "ctrl+right")}
+SYMBOLIC_HOTKEYS_PATH = os.path.expanduser("~/Library/Preferences/com.apple.symbolichotkeys.plist")
+
+
 class ConfigError(Exception):
     pass
+
+
+def system_shortcut(sid):
+    """(keycode, flags) for symbolic hotkey `sid` as the user has it bound, None if it is
+    disabled, or the macOS default if the plist has no entry (never customised).
+    Parameters are [char, keycode, modifiers]; modifiers use the NX bits of CGEventFlags."""
+    name = next(n for n, (i, _) in SYMBOLIC_HOTKEYS.items() if i == sid)
+    default = parse_hotkey(SYMBOLIC_HOTKEYS[name][1])
+    try:
+        with open(SYMBOLIC_HOTKEYS_PATH, "rb") as fh:
+            e = plistlib.load(fh).get("AppleSymbolicHotKeys", {}).get(str(sid))
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return default
+    if not e:
+        return default
+    if not e.get("enabled", True):
+        return None
+    par = e.get("value", {}).get("parameters")
+    if not par or len(par) < 3:
+        return default
+    return int(par[1]), int(par[2]) & MODIFIER_MASK
 
 
 def parse_hotkey(spec):
     """'opt+shift+=' -> (keycode, flags). Raises ConfigError on unknown names.
 
     The key itself may be '+' or '-': write it last, e.g. 'opt+shift++' / 'opt+-'.
+    'spaceleft' / 'spaceright' return the system Spaces binding (None if disabled there).
     """
     if not isinstance(spec, str) or not spec.strip():
         raise ConfigError(f"hotkey must be a non-empty string, got {spec!r}")
     s = spec.strip()
+    if s.lower() in SYMBOLIC_HOTKEYS:
+        return system_shortcut(SYMBOLIC_HOTKEYS[s.lower()][0])
     parts = [p.strip().lower() for p in s.split("+")]
     if parts and parts[-1] == "" and len(parts) >= 2 and parts[-2] != "":
         raise ConfigError(f"hotkey {spec!r}: trailing '+' with no key (for the plus key itself write '...++')")

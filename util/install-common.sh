@@ -3,8 +3,8 @@
 #     exec "$(dirname "$0")/../util/install-common.sh" <name> "$@"
 #
 # Installs ~/Library/LaunchAgents/com.mactools.<name>.plist pointing at THIS checkout
-# (no copying: `git pull` updates the daemon; restart with install.sh again), writes a
-# default config to ~/.config/mactools/<name>.json if absent, and (re)starts the agent.
+# (no copying: `git pull` updates the daemon; restart with install.sh again), validates
+# ~/.config/mactools/<name>.json if present (defaults apply when absent), and (re)starts the agent.
 #
 #   install.sh            install or restart
 #   install.sh --uninstall   stop and remove the LaunchAgent (config and logs are kept)

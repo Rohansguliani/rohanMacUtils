@@ -4,8 +4,8 @@
 - Gesture / thumb button (HID++ feature 0x1B04 "Reprogrammable Controls v4") is *diverted*:
   the mouse stops swallowing it and reports presses to us instead. We map a press to a
   keystroke (default: Mission Control key).
-- Thumb wheel (horizontal scroll) can be mapped to keystrokes too (default: Ctrl+Left/Right,
-  i.e. previous / next Space).
+- Thumb wheel (horizontal scroll) can be mapped to keystrokes too (default: whatever
+  "Move left/right a space" is bound to in System Settings, Ctrl+Left/Right on a stock Mac).
 - Optional: flip the main wheel direction for the *mouse only* (trackpad keeps the system
   "natural" setting).
 
@@ -39,8 +39,8 @@ from macbridge import (CF, CG, FLAG_CTRL, cf_dict, cf_number, cf_to_i64, cfstr, 
 
 DEFAULTS = {
     "gesture_button": "missioncontrol",   # hotkey string, or "" to leave the button alone
-    "thumb_wheel_left": "ctrl+left",      # "" disables; mapped per detent, debounced
-    "thumb_wheel_right": "ctrl+right",
+    "thumb_wheel_left": "spaceleft",      # "" disables; mapped per detent, debounced; swap the two if it feels backwards
+    "thumb_wheel_right": "spaceright",    # spaceleft/spaceright = the system Spaces shortcuts, read at start
     "thumb_wheel_cooldown_ms": 120,
     "invert_main_wheel": False,           # mouse only; trackpad unaffected
     "main_wheel_lines_per_detent": 1,     # macOS default is 1; 3 feels like Windows
@@ -393,6 +393,8 @@ def on_event(proxy, etype, event, refcon):
             CG.CGEventSetIntegerValueField(ev, kCGEventSourceUserData, SYNTHETIC_MARKER)
             CG.CGEventPost(kCGSessionEventTap, ev)
             CF.CFRelease(ev)
+            if DEBUG:
+                log("main wheel %+d -> %+d lines" % (lines, sign * lines * int(CFG["main_wheel_lines_per_detent"])))
             return None
         return event
     # horizontal, non-continuous: thumb wheel
@@ -402,7 +404,10 @@ def on_event(proxy, etype, event, refcon):
     if now - _last_wheel < CFG["thumb_wheel_cooldown_ms"] / 1000.0:
         return None
     _last_wheel = now
-    fire(WHEEL_R if a2 > 0 else WHEEL_L, "thumb wheel %s" % ("right" if a2 > 0 else "left"))
+    # Measured on an MX Master 2S with natural scrolling on: deltaAxis2 > 0 = content moves
+    # right = the user is scrolling towards the left, i.e. the previous Space.
+    left = a2 > 0
+    fire(WHEEL_L if left else WHEEL_R, "thumb wheel %s" % ("left" if left else "right"))
     return None
 
 
@@ -411,10 +416,15 @@ def main():
         print("config OK:", CFG_PATH)
         return
     setup_hid()
+
+    def hk(name, parsed):
+        return "off" if parsed is None else "%s=key%d/%#x" % (name, parsed[0], parsed[1])
+
     daemon.run("logimouse", 1 << kCGEventScrollWheel, on_event, on_tick=on_tick,
-               ready_msg="logimouse ready: gesture=%s wheel=%s/%s invert=%s (%s)" % (
-                   CFG["gesture_button"] or "off", CFG["thumb_wheel_left"] or "off",
-                   CFG["thumb_wheel_right"] or "off", CFG["invert_main_wheel"], CFG_PATH))
+               ready_msg="logimouse ready: gesture=%s wheel=%s/%s invert=%s lines=%s (%s)" % (
+                   hk(CFG["gesture_button"], GESTURE_KEY), hk(CFG["thumb_wheel_left"], WHEEL_L),
+                   hk(CFG["thumb_wheel_right"], WHEEL_R), CFG["invert_main_wheel"],
+                   CFG["main_wheel_lines_per_detent"], CFG_PATH))
 
 
 if __name__ == "__main__":
