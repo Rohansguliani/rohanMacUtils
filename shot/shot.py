@@ -306,20 +306,35 @@ def _show_overlay():
     _OVERLAY.show(S.frame_tl, S.frame, S.scale)
     t1 = time.perf_counter()
     set_crosshair()
+    CF.CFRunLoopTimerSetNextFireDate(_CURSOR_TIMER, CF.CFAbsoluteTimeGetCurrent() + CURSOR_TICK_S)
     trace(f"overlay shown in {(t1 - t0) * 1e3:.1f} ms (+{(time.perf_counter() - t1) * 1e3:.1f} ms cursor), {(time.perf_counter() - S.t_hotkey) * 1e3:.1f} ms after the hotkey")
 
 
 _CROSSHAIR: Any = None
+_CURSOR_TIMER: Any = None
+CURSOR_TICK_S = 0.03
 
 
 def set_crosshair():
-    """NSCursor state is per-app and the frontmost app re-asserts its cursor on every
-    mouseMoved it receives; we are not frontmost. Setting ours after every mouse event
-    (coalesced to the main loop) keeps the crosshair up for the whole selection."""
+    """NSCursor state is per-app and we are not frontmost: the app underneath resets its cursor
+    to the arrow 5-30 ms after the overlay covers it (measured), and re-asserts it on every
+    mouseMoved it gets. So: set ours after showing, after every mouse event, and from a 30 ms
+    timer while selecting. `set` is seed-checked inside AppKit (a no-op unless some process
+    changed the cursor since ours), so the repeats cost nothing."""
     global _CROSSHAIR
     if _CROSSHAIR is None:
         _CROSSHAIR = send(cls("NSCursor"), "crosshairCursor")
     send(_CROSSHAIR, "set")
+
+
+def _cursor_tick(timer, info):
+    if S.active:
+        set_crosshair()
+    else:
+        CF.CFRunLoopTimerSetNextFireDate(timer, CF.CFAbsoluteTimeGetCurrent() + 1e9)  # park until the next capture
+
+
+_CURSOR_CB = TIMER_CB(_cursor_tick)
 
 
 def cancel():
@@ -328,6 +343,7 @@ def cancel():
 
 
 def _teardown():
+    CF.CFRunLoopTimerSetNextFireDate(_CURSOR_TIMER, CF.CFAbsoluteTimeGetCurrent() + 1e9)
     _OVERLAY.hide()
     send(send(cls("NSCursor"), "arrowCursor"), "set")
     if S.frame:
@@ -1043,7 +1059,7 @@ def on_event(proxy, etype, event, refcon):
 
 
 def main():
-    global _OVERLAY, _EDITOR, _MAIN_SRC, CATransaction
+    global _OVERLAY, _EDITOR, _MAIN_SRC, _CURSOR_TIMER, CATransaction
     if "--check-config" in sys.argv:
         print("config OK:", CFG_PATH)
         return
@@ -1070,6 +1086,9 @@ def main():
     _MAIN_SRC = CF.CFRunLoopSourceCreate(None, 0, C.byref(ctx))
     CF.CFRunLoopAddSource(CF.CFRunLoopGetMain(), _MAIN_SRC, kCFRunLoopCommonModes)
     main._keep = (perform, ctx)  # type: ignore[attr-defined]
+    # the crosshair watchdog: parked far in the future, pulled in by each capture
+    _CURSOR_TIMER = CF.CFRunLoopTimerCreate(None, CF.CFAbsoluteTimeGetCurrent() + 1e9, CURSOR_TICK_S, 0, 0, _CURSOR_CB, None)
+    CF.CFRunLoopAddTimer(CF.CFRunLoopGetMain(), _CURSOR_TIMER, kCFRunLoopCommonModes)
 
     _OVERLAY = Overlay()
     _EDITOR = Editor()

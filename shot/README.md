@@ -88,8 +88,10 @@ at start. See the top-level README for the ⌘⇧G trick.
   present and fast on 26.x; ScreenCaptureKit is async/Swift-shaped and not reachable from
   ctypes without a helper binary. If Apple removes it this package needs that helper.
 - One private call: `SLSSetConnectionProperty(..., "SetsCursorInBackground")` so the
-  crosshair cursor shows while a background process owns the selection; the cursor is
-  re-asserted on every mouse move because the frontmost app resets it on each one it
-  receives. Without the property the arrow cursor stays; everything else works.
+  crosshair cursor shows while a background process owns the selection. The app underneath
+  resets its cursor to the arrow 5–30 ms after the overlay covers it and again on every
+  mouse move it gets, so the crosshair is re-asserted after showing, on every mouse event,
+  and from a 30 ms timer while selecting (AppKit skips the call unless the cursor actually
+  changed). Without the property the arrow cursor stays; everything else works.
 - Multi-display: the overlay covers the display under the cursor at hotkey time, at that
   display's own backing scale.
