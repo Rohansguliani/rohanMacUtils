@@ -1,7 +1,19 @@
-# spaceswitch
+# spaceswitch (macOS 27)
 
 Makes switching Spaces instant. Your existing shortcuts and gestures keep working — this
 only removes the slide animation (and the ~0.5 s you cannot type during it).
+
+**macOS 27 differences** (the Dock now reads the IOHID event attached to the gesture, not
+the CGEvent fields):
+
+- The first horizontal swipe after every Dock start is native (animated): that swipe is
+  *recorded* and its payload is replayed, with the numbers patched, for every switch after
+  it. The recording is cached in `~/.cache/mactools/spaceswitch27.json` per Dock pid.
+- A forged switch is a flick (`Began(~0) → Ended(~0)` at terminal velocity); it commits in
+  ~40 ms and moves exactly one Space. Progress 1.0 recipes move several Spaces on 27.
+- **Mission Control is left native for now.** No forged vertical sequence is accepted by the
+  macOS 27 Dock yet (`trackpad_vertical` is ignored; the shortcut and the 4-finger swipe
+  pass straight through).
 
 - **Keyboard** — whatever you have bound in System Settings → Keyboard → Shortcuts →
   Mission Control for *Move left/right a space* (default Ctrl+←/→) switches instantly.
@@ -9,9 +21,6 @@ only removes the slide animation (and the ~0.5 s you cannot type during it).
   (no rubber-band bounce).
 - **Trackpad** — 3- or 4-finger horizontal swipes switch instantly, one Space per swipe,
   honouring your natural-scrolling setting.
-- **Mission Control** — the vertical swipe and the Mission Control shortcut (default
-  Ctrl+↑) open and close Mission Control without the zoom animation. App Exposé is left
-  to macOS.
 
 spaceswitch reads the bindings from `com.apple.symbolichotkeys` and picks up changes
 within a few seconds, so there is nothing to configure twice.

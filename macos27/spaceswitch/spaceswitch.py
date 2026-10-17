@@ -1,18 +1,19 @@
 #!/usr/bin/python3
-"""spaceswitch (macOS 27+): Space switching and Mission Control with zero animation.
+"""spaceswitch (macOS 27+): Space switching and Mission Control with no animation.
 
-How (macOS 27 architecture):
-In macOS 27, Apple replaced Dock's legacy C DockSwipe decoder with
-WindowManager.SystemGestureManager.handleEvent(CGEventRef), which extracts a VendorDefined
-child IOHIDEvent (UsagePage = 0xFF00, Usage = 0x0070) containing a Gestures.BinaryEncoder
-stream of [GestureNodeID : [OpaqueDataEvent]].
+How: the Dock listens for private "DockSwipe" gesture events. On macOS 26 the Dock decoded
+the CGEvent fields directly, so we could post a forged gesture that claimed the finger had
+already travelled the full distance at terminal velocity and the Dock committed instantly.
+On macOS 27 the Dock hands the event to WindowManager.SystemGestureManager, which reads the
+IOHIDEvent attached to the CGEvent (field 4205) instead: a FluidTouchGesture record plus a
+VendorDefined child (usage page 0xFF00, usage 0x0070) carrying a Gestures.framework stream.
 
-When any horizontal (3/4-finger Space switch) or vertical (4-finger Mission Control) trackpad
-gesture begins, WindowServer attaches Dock's live GestureNodeID header in that VendorDefined
-payload. We capture that live GestureNodeID header on frame 0 (and cache it per Dock PID across
-restarts for keyboard/mouse shortcuts), then synthesize a 3-event Began(eps) -> Active(1.0) ->
-Ended(1.0, terminal velocity) sequence encoded in Gestures.BinaryEncoder wire format wrapped in
-IOHIDEventCreateVendorDefinedEvent(0xFF00, 0x0070) + field 4205.
+That stream is undocumented, so we do not synthesise it. We record it: the first real swipe
+of each kind after start gives us the Began / Changed / Ended payloads verbatim (one per
+motion, cached per Dock pid in ~/.cache/mactools). To switch instantly we replay those three
+payloads back to back with only the numbers patched in place (progress, velocity, timestamp,
+same byte lengths), so whatever framing the Dock expects is preserved. The first swipe of
+each kind after a Dock restart is therefore native/animated; everything after is instant.
 
 Permissions: Accessibility (granted to /usr/bin/python3).
 """
@@ -35,63 +36,54 @@ from macbridge import (CF, CG, CS, LIBSYS, SL, CID, FLAG_CTRL, MODIFIER_MASK, cf
                        kCFPreferencesAnyApplication, kCGEventKeyDown, kCGEventKeyUp, kCGEventSourceUnixProcessID,
                        kCGEventSourceUserData, kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput,
                        kCGKeyboardEventAutorepeat, kCGKeyboardEventKeycode, kCGSessionEventTap,
-                       kCGWindowListOptionOnScreenOnly, K_WIN_LAYER, K_WIN_OWNER, log, vp, u32, i32)
+                       kCGWindowListOptionOnScreenOnly, K_WIN_LAYER, K_WIN_OWNER, log, vp)
 
 IOK = C.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
 CG.CGEventCopyIOHIDEvent.restype = vp
 CG.CGEventCopyIOHIDEvent.argtypes = [vp]
-IOK.IOHIDEventCreateFluidTouchGestureEvent.restype = vp
-IOK.IOHIDEventCreateFluidTouchGestureEvent.argtypes = [vp, C.c_uint64, u32, C.c_double, C.c_double, C.c_double, u32]
-IOK.IOHIDEventCreateVendorDefinedEvent.restype = vp
-IOK.IOHIDEventCreateVendorDefinedEvent.argtypes = [vp, C.c_uint64, u32, u32, u32, C.c_char_p, C.c_long, u32]
-IOK.IOHIDEventAppendEvent.restype = None
-IOK.IOHIDEventAppendEvent.argtypes = [vp, vp, u32]
 IOK.IOHIDEventCreateData.restype = vp
 IOK.IOHIDEventCreateData.argtypes = [vp, vp]
-IOK.IOHIDEventGetChildren.restype = vp
-IOK.IOHIDEventGetChildren.argtypes = [vp]
-IOK.IOHIDEventGetIntegerValue.restype = C.c_int64
-IOK.IOHIDEventGetIntegerValue.argtypes = [vp, u32]
-IOK.IOHIDEventGetDataValue.restype = vp
-IOK.IOHIDEventGetDataValue.argtypes = [vp, u32]
 
 DEFAULTS = {
     "keyboard": True,                 # intercept the Spaces / Mission Control shortcuts
     "trackpad_horizontal": True,      # 3/4-finger left/right swipe
     "trackpad_vertical": True,        # 4-finger up/down swipe (Mission Control)
-    "extra_switch_modifiers": [],     # e.g. ["cmd"]: ALSO treat Cmd+Left/Right as switch
+    "extra_switch_modifiers": [],     # e.g. ["cmd"]: ALSO treat Cmd+Left/Right as switch (on top of the system shortcut)
     "key_repeat_interval_ms": 120,    # min gap between switches while a key is held
     "debug": False,
 }
 CFG, CFG_PATH = config.load("spaceswitch", DEFAULTS)
 TRACE = bool(CFG["debug"])
 
-# --- CGS & Gestures.BinaryEncoder constants (macOS 27) -----------------------------------
+# --- private CGEvent fields (WindowServer/Dock ABI; reverse-engineered, macOS 12-27) ----
 F_CGS_EVENT_TYPE, F_GESTURE_HID_TYPE, F_SWIPE_MOTION = 55, 110, 123
 F_SWIPE_PROGRESS, F_SWIPE_VEL_X, F_SWIPE_VEL_Y, F_GESTURE_PHASE = 124, 129, 130, 132
 CGS_EVENT_GESTURE, CGS_EVENT_DOCK_CONTROL = 29, 30
 HID_DOCK_SWIPE = 23
 MOTION_HORIZONTAL, MOTION_VERTICAL = 1, 2
 PHASE_BEGAN, PHASE_CHANGED, PHASE_ENDED, PHASE_CANCELLED = 1, 2, 4, 8
-GPHASE_BEGAN, GPHASE_ACTIVE, GPHASE_ENDED, GPHASE_FAILED = 0, 1, 2, 3
 FIELD_IOHID_PAYLOAD = 4205
+# IOHIDEvent serialisation (IOHIDSystemQueueElement + flat IOHIDEventData records)
+QUEUE_HDR = struct.Struct("<QQIII")          # timeStamp, senderID, options, attributeLength, eventCount
+EV_HDR = struct.Struct("<IIIB3x")            # size, type, options, depth
+IOHID_TYPE_VENDOR, IOHID_TYPE_VELOCITY, IOHID_TYPE_FLUID_TOUCH_GESTURE = 1, 9, 23
 VENDOR_USAGE_PAGE, VENDOR_USAGE = 0xFF00, 0x0070
-HID_F_VENDOR_USAGE_PAGE, HID_F_VENDOR_USAGE, HID_F_VENDOR_LEN, HID_F_VENDOR_DATA = 0x10000, 0x10001, 0x10003, 0x10004
-GF_MOTION, GF_PROGRESS, GF_FLAVOR = 0x170001, 0x170002, 0x170005
-GF_VEL_X, GF_VEL_Y = 0x090000, 0x090001
-DOCK_OVERVIEW_LAYER = 18
+# Gestures.framework stream: IOHIDEvent field keys as zig-zag varints, tag 2 = little-endian double
+GF_PROGRESS, GF_VEL_X, GF_VEL_Y = 0x170002, 0x090000, 0x090001
+DOCK_OVERVIEW_LAYER = 18             # Dock owns a layer-18 window for the life of any overview
 CURRENT_OS_SPACES_MASK = (1 << 0) | (1 << 3)
-SYNTHETIC_MARKER = 0x53505357        # 'SPSW'
+SYNTHETIC_MARKER = 0x53505357        # 'SPSW' in source user data: events we posted
 KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_MISSION_CONTROL = 123, 124, 126, 125, 160
 
-INSTANT_VELOCITY = 2000.0
-EPSILON_PROGRESS = 1e-4
-SWIPE_DIRECTION_THRESHOLD = 0.05
-MIN_SWITCH_GAP = 0.08
-MC_EPSILON = 1.0 / 65536.0
-MC_VELOCITY = 9999.0
-MC_GESTURE_TIMEOUT = 0.5
-PREDICTION_TTL = 0.5
+# --- tuning (all measured on macOS 26; see docstrings) -----------------------------------
+INSTANT_VELOCITY = 2000.0            # anything well above the Dock's flick threshold
+EPSILON_PROGRESS = 1e-4              # Began progress; FLT_TRUE_MIN flushes to zero on Apple Silicon
+SWIPE_DIRECTION_THRESHOLD = 0.05     # |progress| before a real swipe's direction is trusted
+MIN_SWITCH_GAP = 0.08                # s between two forged switches (WindowServer re-layering)
+MC_EPSILON = 1.0 / 65536.0           # smallest signed 16.16 step
+MC_VELOCITY = 9999.0                 # removes Mission Control's final zoom frames on dismissal
+MC_GESTURE_TIMEOUT = 0.5             # s before an unresolved held gesture is replayed
+PREDICTION_TTL = 0.5                 # s to trust our own "we just moved to index N" over CGS
 MC_OWNED_DIRECTION: dict[str | None, int] = {"desktop": 1, "mission-control": -1, "app-expose": 1}
 CACHE_PATH = os.path.expanduser("~/.cache/mactools/spaceswitch27.json")
 
@@ -107,8 +99,9 @@ def trace(msg):
         log(msg)
 
 
-# --- Gestures.BinaryEncoder codec & Dock GestureNodeID template cache -------------------
-def uleb128(n: int) -> bytes:
+# --- recorded gesture payloads ----------------------------------------------------------
+def zleb128(n: int) -> bytes:
+    n = (n << 1) ^ (n >> 63)
     out = bytearray()
     while True:
         b = n & 0x7F
@@ -118,247 +111,202 @@ def uleb128(n: int) -> bytes:
             return bytes(out)
 
 
-def zleb128(n: int) -> bytes:
-    return uleb128((n << 1) ^ (n >> 63))
+DOUBLE_KEYS = {k: zleb128(k) + b"\x02" for k in (GF_PROGRESS, GF_VEL_X, GF_VEL_Y)}
 
 
-def read_uleb128(buf: bytes, pos: int) -> tuple[int, int] | None:
-    val = shift = 0
-    while pos < len(buf):
-        b = buf[pos]
-        pos += 1
-        val |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return val, pos
-        shift += 7
-        if shift > 70:
-            return None
-    return None
+def fixed1616(v):
+    f = max(-(2 ** 31), min(2 ** 31 - 1, int(v * 65536.0)))
+    if f == 0 and v != 0:
+        return 1 if v > 0 else -1
+    return f
 
 
-def read_zleb128(buf: bytes, pos: int) -> tuple[int, int] | None:
-    r = read_uleb128(buf, pos)
-    if r is None:
-        return None
-    zz, pos = r
-    return (zz >> 1) ^ -(zz & 1), pos
+def iter_records(blob):
+    """(offset, size, type, depth) for each IOHIDEventData record in a serialised IOHIDEvent."""
+    if len(blob) < QUEUE_HDR.size:
+        return
+    _, _, _, attr_len, count = QUEUE_HDR.unpack_from(blob, 0)
+    pos = QUEUE_HDR.size + attr_len
+    for _ in range(count):
+        if pos + EV_HDR.size > len(blob):
+            return
+        size, typ, _, depth = EV_HDR.unpack_from(blob, pos)
+        if size < EV_HDR.size or pos + size > len(blob):
+            return
+        yield pos, size, typ, depth
+        pos += size
 
 
-def encode_opaque_event(ev_id: int, gphase: int, ts: int,
-                        fields: list[tuple[int, int, int | float]]) -> bytes:
-    b = bytearray()
-    b += zleb128(ev_id)
-    b.append(gphase)
-    b += zleb128(ts)
-    b += uleb128(len(fields))
-    for k, tag, val in fields:
-        b += zleb128(k)
-        b.append(tag)
-        if tag == 0:
-            b.append(1 if val else 0)
-        elif tag == 1:
-            b += zleb128(int(val))
+def describe_payload(blob):
+    parts = []
+    for pos, size, typ, depth in iter_records(blob):
+        if typ == IOHID_TYPE_FLUID_TOUCH_GESTURE and size >= 40:
+            opts, motion, flavor, prog = struct.unpack_from("<I", blob, pos + 8)[0], *struct.unpack_from("<HHi", blob, pos + 32)
+            parts.append("fluid(opts=%#x motion=%d flavor=%d progress=%.3f)" % (opts, motion, flavor, prog / 65536.0))
+        elif typ == IOHID_TYPE_VELOCITY and size >= 28:
+            vx, vy = struct.unpack_from("<ii", blob, pos + 16)
+            parts.append("velocity(%.1f, %.1f)" % (vx / 65536.0, vy / 65536.0))
+        elif typ == IOHID_TYPE_VENDOR and size >= 28:
+            page, usage, _, length = struct.unpack_from("<HHII", blob, pos + 16)
+            parts.append("vendor(%#x/%#x %dB)" % (page, usage, length))
         else:
-            b += struct.pack("<d", float(val))
+            parts.append("type%d(%dB d%d)" % (typ, size, depth))
+    return " ".join(parts) or "unparsed"
+
+
+def patch_payload(tmpl, progress, vx, vy):
+    """Copy of a recorded payload with progress / velocity / timestamp rewritten in place."""
+    b = bytearray(tmpl)
+    struct.pack_into("<Q", b, 0, LIBSYS.mach_absolute_time())
+    for pos, size, typ, _ in iter_records(b):
+        if typ == IOHID_TYPE_FLUID_TOUCH_GESTURE and size >= 40:
+            struct.pack_into("<i", b, pos + 36, fixed1616(progress))
+        elif typ == IOHID_TYPE_VELOCITY and size >= 28:
+            struct.pack_into("<ii", b, pos + 16, fixed1616(vx), fixed1616(vy))
+        elif typ == IOHID_TYPE_VENDOR and size >= 28:
+            page, usage, _, length = struct.unpack_from("<HHII", b, pos + 16)
+            if page != VENDOR_USAGE_PAGE or usage != VENDOR_USAGE:
+                continue
+            start, end = pos + 28, min(pos + 28 + length, len(b))
+            seg = bytes(b[start:end])
+            for key, val in ((GF_PROGRESS, progress), (GF_VEL_X, vx), (GF_VEL_Y, vy)):
+                pat = DOUBLE_KEYS[key]
+                i = seg.find(pat)
+                while i != -1 and start + i + len(pat) + 8 <= end:
+                    struct.pack_into("<d", b, start + i + len(pat), float(val))
+                    i = seg.find(pat, i + 1)
     return bytes(b)
 
 
-def match_opaque_at(buf: bytes, pos: int) -> tuple[int, int, int, list[tuple[int, int, int | float]]] | None:
-    r_id = read_zleb128(buf, pos)
-    if r_id is None or not (0 <= r_id[0] <= 0xFFFFFFFF):
-        return None
-    ev_id, p = r_id
-    if p >= len(buf) or buf[p] not in (0, 1, 2, 3):
-        return None
-    phase = buf[p]
-    p += 1
-    r_ts = read_zleb128(buf, p)
-    if r_ts is None or r_ts[0] < 1_000_000:
-        return None
-    _, p = r_ts
-    r_cnt = read_uleb128(buf, p)
-    if r_cnt is None or not (1 <= r_cnt[0] <= 24):
-        return None
-    cnt, p = r_cnt
-    fields: list[tuple[int, int, int | float]] = []
-    for _ in range(cnt):
-        rk = read_zleb128(buf, p)
-        if rk is None or rk[1] >= len(buf):
-            return None
-        k, p = rk
-        tag = buf[p]
-        p += 1
-        if tag == 0:
-            if p >= len(buf) or buf[p] not in (0, 1):
-                return None
-            fields.append((k, 0, int(buf[p])))
-            p += 1
-        elif tag == 1:
-            rv = read_zleb128(buf, p)
-            if rv is None:
-                return None
-            fields.append((k, 1, rv[0]))
-            p = rv[1]
-        elif tag == 2:
-            if p + 8 > len(buf):
-                return None
-            fields.append((k, 2, struct.unpack("<d", buf[p:p + 8])[0]))
-            p += 8
-        else:
-            return None
-    if not any(k == GF_MOTION for k, _, _ in fields):
-        return None
-    return p, ev_id, phase, fields
-
-
-def rewrite_vendor_stream(buf: bytes, motion: int, gphase: int, ts: int,
-                          progress: float, vx: float, vy: float) -> bytes | None:
-    """Rewrite every OpaqueDataEvent across all registered GestureNodeIDs in a 0xFF00/0x0070 packet."""
-    out = bytearray()
-    pos = n = 0
-    while pos < len(buf):
-        m = match_opaque_at(buf, pos)
-        if m is None:
-            out.append(buf[pos])
-            pos += 1
-        else:
-            end, ev_id, _, fields = m
-            fmap = {k: (t, v) for k, t, v in fields}
-            fmap[GF_MOTION] = (1, motion)
-            fmap[GF_FLAVOR] = (1, 3)
-            fmap[GF_PROGRESS] = (2, progress)
-            fmap[GF_VEL_X] = (2, vx)
-            fmap[GF_VEL_Y] = (2, vy)
-            out += encode_opaque_event(ev_id, gphase, ts, [(k, t, v) for k, (t, v) in fmap.items()])
-            pos = end
-            n += 1
-    return bytes(out) if n > 0 else None
-
-
-def dock_pid() -> int:
+def dock_pid():
     try:
-        return int(subprocess.check_output(["pgrep", "-x", "Dock"], text=True).strip().splitlines()[0])
-    except Exception:
+        return int(subprocess.check_output(["pgrep", "-x", "Dock"], text=True).split()[0])
+    except (subprocess.CalledProcessError, ValueError, IndexError, OSError):
         return 0
 
 
-class TemplateCache:
-    """Stores raw 0xFF00/0x0070 multi-node packets for horizontal (1) & vertical (2) per Dock PID."""
+class Recordings:
+    """Real Began / Changed / Ended payloads per motion, from the first complete swipe seen.
+
+    Keyed by Dock pid: the vendor stream may reference per-Dock-instance gesture ids, so a
+    Dock restart invalidates everything. Nothing here forks on the event path; the pid is
+    re-checked from the 5 s tick.
+    """
+    PHASES = (PHASE_BEGAN, PHASE_CHANGED, PHASE_ENDED)
+
     def __init__(self):
         self.pid = dock_pid()
-        self.by_motion: dict[int, bytes] = {}
+        self.payloads: dict[tuple[int, int], bytes] = {}
+        self.complete: set[int] = set()
         self.load()
 
     def load(self):
+        if not os.path.exists(CACHE_PATH):
+            return
         try:
             with open(CACHE_PATH, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
             if d.get("dock_pid") != self.pid:
+                log("gesture cache is for Dock pid %s (now %d); re-recording" % (d.get("dock_pid"), self.pid))
                 return
-            for m_str, raw_hex in d.get("packets", {}).items():
-                self.by_motion[int(m_str)] = bytes.fromhex(raw_hex)
-        except Exception:
-            pass
+            for key, raw_hex in d["payloads"].items():
+                motion, phase = (int(x) for x in key.split(":"))
+                self.payloads[(motion, phase)] = bytes.fromhex(raw_hex)
+            self.complete = {m for m in (MOTION_HORIZONTAL, MOTION_VERTICAL) if self.has(m)}
+            log("gesture cache loaded: %s" % ", ".join(self.name(m) for m in sorted(self.complete)))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log(f"gesture cache unreadable ({e}); re-recording")
 
     def save(self):
         try:
             os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-            data = {
-                "dock_pid": self.pid,
-                "packets": {str(m): raw.hex() for m, raw in self.by_motion.items()},
-            }
             with open(CACHE_PATH, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-        except Exception as e:
-            trace(f"cache save error: {e}")
+                json.dump({"dock_pid": self.pid,
+                           "payloads": {"%d:%d" % k: v.hex() for k, v in self.payloads.items()}}, fh)
+        except OSError as e:
+            log(f"gesture cache not saved: {e}")
+
+    @staticmethod
+    def name(motion):
+        return "horizontal" if motion == MOTION_HORIZONTAL else "vertical"
+
+    def has(self, motion):
+        return all((motion, p) in self.payloads for p in self.PHASES)
 
     def check_pid(self):
+        if self.pid:
+            try:
+                os.kill(self.pid, 0)  # still alive: nothing to do, no fork
+                return
+            except OSError:
+                pass
         cur = dock_pid()
         if cur and cur != self.pid:
-            log(f"Dock restarted ({self.pid} -> {cur}); clearing gesture node cache")
+            log(f"Dock restarted ({self.pid} -> {cur}); recorded gestures discarded")
             self.pid = cur
-            self.by_motion.clear()
+            self.payloads.clear()
+            self.complete.clear()
 
-    def capture(self, event, motion: int) -> None:
-        self.check_pid()
+    def record(self, event, motion, phase):
+        """Began restarts the recording; Changed keeps the latest frame; Ended completes it."""
+        if motion in self.complete or phase not in self.PHASES:
+            return
+        if phase == PHASE_CHANGED and (motion, PHASE_BEGAN) not in self.payloads:
+            return
+        if phase == PHASE_ENDED and not all((motion, p) in self.payloads for p in (PHASE_BEGAN, PHASE_CHANGED)):
+            return
         hid = CG.CGEventCopyIOHIDEvent(event)
         if not hid:
             return
-        try:
-            children = IOK.IOHIDEventGetChildren(hid)
-            if not children:
-                return
-            for i in range(CF.CFArrayGetCount(children)):
-                c = CF.CFArrayGetValueAtIndex(children, i)
-                if (IOK.IOHIDEventGetIntegerValue(c, HID_F_VENDOR_USAGE_PAGE) == VENDOR_USAGE_PAGE
-                        and IOK.IOHIDEventGetIntegerValue(c, HID_F_VENDOR_USAGE) == VENDOR_USAGE):
-                    n = IOK.IOHIDEventGetIntegerValue(c, HID_F_VENDOR_LEN)
-                    ptr = IOK.IOHIDEventGetDataValue(c, HID_F_VENDOR_DATA)
-                    if n <= 0 or not ptr:
-                        continue
-                    raw = C.string_at(ptr, n)
-                    if rewrite_vendor_stream(raw, motion, GPHASE_BEGAN, 1_000_001, 0.0, 0.0, 0.0) is not None:
-                        was_missing = motion not in self.by_motion
-                        self.by_motion[motion] = raw
-                        if was_missing:
-                            log(f"learned macOS 27 GestureNodeID packet for motion={motion} ({n} B)")
-                            self.save()
-        finally:
-            CF.CFRelease(hid)
+        data = IOK.IOHIDEventCreateData(None, hid)
+        CF.CFRelease(hid)
+        if not data:
+            return
+        blob = C.string_at(CF.CFDataGetBytePtr(data), CF.CFDataGetLength(data))
+        CF.CFRelease(data)
+        if phase == PHASE_BEGAN:
+            self.payloads.pop((motion, PHASE_CHANGED), None)
+            self.payloads.pop((motion, PHASE_ENDED), None)
+        self.payloads[(motion, phase)] = blob
+        if phase != PHASE_CHANGED:
+            log("recorded %s phase %d: %d B %s" % (self.name(motion), phase, len(blob), describe_payload(blob)))
+            log("payload hex: " + blob.hex())
+        if self.has(motion):
+            self.complete.add(motion)
+            log("%s gesture recorded; switches are instant from now on" % self.name(motion))
+            self.save()
 
-    def get(self, motion: int) -> bytes | None:
-        self.check_pid()
-        return self.by_motion.get(motion)
+    def get(self, motion, phase):
+        return self.payloads.get((motion, phase)) if motion in self.complete else None
 
 
-TEMPLATES = TemplateCache()
+RECORDINGS = Recordings()
 
 
-def make_cgevent_27(motion: int, cgs_phase: int, gphase: int, progress: float, vel_x: float, vel_y: float):
-    raw_tmpl = TEMPLATES.get(motion)
-    if not raw_tmpl:
+def make_event(motion, phase, progress, vx, vy):
+    payload = RECORDINGS.get(motion, phase)
+    if payload is None:
         return None
-    ts = LIBSYS.mach_absolute_time()
-    vendor_bytes = rewrite_vendor_stream(raw_tmpl, motion, gphase, ts, progress, vel_x, vel_y)
-    if not vendor_bytes:
-        return None
-
-    parent = IOK.IOHIDEventCreateFluidTouchGestureEvent(
-        None, ts, motion, 0.0, 0.0, progress, (cgs_phase & 0xFF) << 24)
-    if not parent:
-        return None
-    child = IOK.IOHIDEventCreateVendorDefinedEvent(
-        None, ts, VENDOR_USAGE_PAGE, VENDOR_USAGE, 0, vendor_bytes, len(vendor_bytes), 0)
-    if not child:
-        CF.CFRelease(parent)
-        return None
-    IOK.IOHIDEventAppendEvent(parent, child, 0)
-    hid_data = IOK.IOHIDEventCreateData(None, parent)
-    CF.CFRelease(child)
-    CF.CFRelease(parent)
-    if not hid_data:
-        return None
-    hid_bytes = C.string_at(CF.CFDataGetBytePtr(hid_data), CF.CFDataGetLength(hid_data))
-    CF.CFRelease(hid_data)
-
     ev = CG.CGEventCreate(None)
     if not ev:
         return None
     CG.CGEventSetIntegerValueField(ev, F_CGS_EVENT_TYPE, CGS_EVENT_DOCK_CONTROL)
     CG.CGEventSetIntegerValueField(ev, F_GESTURE_HID_TYPE, HID_DOCK_SWIPE)
-    CG.CGEventSetIntegerValueField(ev, F_GESTURE_PHASE, cgs_phase)
+    CG.CGEventSetIntegerValueField(ev, F_GESTURE_PHASE, phase)
     CG.CGEventSetIntegerValueField(ev, F_SWIPE_MOTION, motion)
     CG.CGEventSetDoubleValueField(ev, F_SWIPE_PROGRESS, progress)
-    CG.CGEventSetDoubleValueField(ev, F_SWIPE_VEL_X, vel_x)
-    CG.CGEventSetDoubleValueField(ev, F_SWIPE_VEL_Y, vel_y)
-
+    CG.CGEventSetDoubleValueField(ev, F_SWIPE_VEL_X, vx)
+    CG.CGEventSetDoubleValueField(ev, F_SWIPE_VEL_Y, vy)
     data = CG.CGEventCreateData(None, ev)
     CF.CFRelease(ev)
     if not data:
         return None
     blob = C.string_at(CF.CFDataGetBytePtr(data), CF.CFDataGetLength(data))
     CF.CFRelease(data)
-    blob += struct.pack(">HH", len(hid_bytes), FIELD_IOHID_PAYLOAD) + hid_bytes
+    if blob[:4] != b"\x00\x00\x00\x02":
+        return None  # serialization format changed; do not post garbage
+    hid = patch_payload(payload, progress, vx, vy)
+    blob += struct.pack(">HH", len(hid), FIELD_IOHID_PAYLOAD) + hid
     new_data = CF.CFDataCreate(None, blob, len(blob))
     if not new_data:
         return None
@@ -367,6 +315,25 @@ def make_cgevent_27(motion: int, cgs_phase: int, gphase: int, progress: float, v
     if out:
         CG.CGEventSetIntegerValueField(out, kCGEventSourceUserData, SYNTHETIC_MARKER)
     return out
+
+
+def post_sequence(proxy, motion, direction, steps):
+    """Post (phase, progress, velocity) steps built from the recordings; False if any is missing."""
+    sign = float(direction)
+    events = [make_event(motion, phase, sign * progress, sign * velocity, sign * velocity)
+              for phase, progress, velocity in steps]
+    if not all(events):
+        for ev in events:
+            if ev:
+                CF.CFRelease(ev)
+        return False
+    for ev in events:
+        if proxy:
+            CG.CGEventTapPostEvent(proxy, ev)
+        else:
+            CG.CGEventPost(kCGSessionEventTap, ev)
+        CF.CFRelease(ev)
+    return True
 
 
 # --- system shortcuts -------------------------------------------------------------------
@@ -560,46 +527,40 @@ def natural_scrolling():
     return on
 
 
-# --- macOS 27 instant forged transitions ------------------------------------------------
-def post_dock_swipe_27(cgs_phase, gphase, right, progress):
-    sign = 1.0 if right else -1.0
-    ev = make_cgevent_27(MOTION_HORIZONTAL, cgs_phase, gphase,
-                         sign * progress, sign * INSTANT_VELOCITY, 0.0)
-    if not ev:
-        return False
-    CG.CGEventPost(kCGSessionEventTap, ev)
-    CF.CFRelease(ev)
-    return True
-
-
-def post_mc_transition_27(proxy, direction):
-    sign = float(direction)
-    events = [
-        make_cgevent_27(MOTION_VERTICAL, PHASE_BEGAN, GPHASE_BEGAN, sign * MC_EPSILON, 0.0, 0.0),
-        make_cgevent_27(MOTION_VERTICAL, PHASE_CHANGED, GPHASE_ACTIVE, sign * 1.0, 0.0, 0.0),
-        make_cgevent_27(MOTION_VERTICAL, PHASE_ENDED, GPHASE_ENDED, sign * 1.0, sign * MC_VELOCITY, sign * MC_VELOCITY),
-    ]
-    if not all(events):
-        for ev in events:
-            if ev:
-                CF.CFRelease(ev)
-        return False
-    for ev in events:
-        if proxy:
-            CG.CGEventTapPostEvent(proxy, ev)
-        else:
-            CG.CGEventPost(kCGSessionEventTap, ev)
-        CF.CFRelease(ev)
-    return True
-
-
+# --- forged transitions ---------------------------------------------------------------
 _last_switch_done = 0.0
 
 
+def hid_progress(event):
+    """Progress as carried in the event's own IOHID FluidTouchGesture record (what the macOS 27
+    Dock reads), or None."""
+    hid = CG.CGEventCopyIOHIDEvent(event)
+    if not hid:
+        return None
+    data = IOK.IOHIDEventCreateData(None, hid)
+    CF.CFRelease(hid)
+    if not data:
+        return None
+    blob = C.string_at(CF.CFDataGetBytePtr(data), CF.CFDataGetLength(data))
+    CF.CFRelease(data)
+    for pos, size, typ, _ in iter_records(blob):
+        if typ == IOHID_TYPE_FLUID_TOUCH_GESTURE and size >= 40:
+            return struct.unpack_from("<i", blob, pos + 36)[0] / 65536.0
+    return None
+
+
 def switch(right):
+    """One Space in the given direction. False at the edge (nothing posted), None if we have
+    no recording yet for this Dock (caller lets the native switch happen).
+
+    macOS 27 recipe (measured with sstest.py, 36 ms to commit, exactly one Space): a flick,
+    Began(~0) -> Ended(~0) at terminal velocity. Any Changed/Ended with progress 1.0 commits
+    a Space on its own and the velocity then projects further ones ("jumps around"), and
+    velocities in the real events' range (~1-5) give the stock 500 ms animation. Positive
+    progress moves to the previous Space (the opposite of the macOS 26 CGEvent field)."""
     global _last_switch_done
-    if TEMPLATES.get(MOTION_HORIZONTAL) is None:
-        return None  # no template yet for current Dock session; let native shortcut pass through
+    if not RECORDINGS.has(MOTION_HORIZONTAL):
+        return None
     info = space_info()
     target = None
     if info:
@@ -611,17 +572,25 @@ def switch(right):
     gap = MIN_SWITCH_GAP - (time.monotonic() - _last_switch_done)
     if gap > 0:
         time.sleep(gap)
-    for cgs_p, gp, prog in (
-        (PHASE_BEGAN, GPHASE_BEGAN, EPSILON_PROGRESS),
-        (PHASE_CHANGED, GPHASE_ACTIVE, 1.0),
-        (PHASE_ENDED, GPHASE_ENDED, 1.0),
-    ):
-        if not post_dock_swipe_27(cgs_p, gp, right, prog):
-            return False
+    if not post_sequence(None, MOTION_HORIZONTAL, -1 if right else 1,
+                         [(PHASE_BEGAN, EPSILON_PROGRESS, INSTANT_VELOCITY), (PHASE_ENDED, EPSILON_PROGRESS, INSTANT_VELOCITY)]):
+        return False
     _last_switch_done = time.monotonic()
     if info:
         _predicted[info[0]] = (target, _last_switch_done)
     return True
+
+
+# No forged vertical recipe works on macOS 27 yet (sstest/mctest: 2- and 3-event sequences at
+# every velocity are ignored by the Dock), so Mission Control stays native until one is found.
+MC_SUPPORTED = False
+
+
+def post_mc_transition(proxy, direction):
+    if not MC_SUPPORTED:
+        return False
+    return post_sequence(proxy, MOTION_VERTICAL, direction,
+                         [(PHASE_BEGAN, MC_EPSILON, 0.0), (PHASE_CHANGED, 1.0, 0.0), (PHASE_ENDED, 1.0, MC_VELOCITY)])
 
 
 # --- gesture state machine --------------------------------------------------------------
@@ -693,7 +662,7 @@ def mc_direction(sign):
 def mc_resolve(proxy, event, sign, claim):
     origin = G.mc_origin
     d = mc_direction(sign)
-    if d and post_mc_transition_27(proxy, d):
+    if d and post_mc_transition(proxy, d):
         mc_drop_pending()
         G.mc_claimed, G.mc_claimed_since = claim, time.monotonic()
         log("swipe %s (%s)" % ("up" if d > 0 else "down", origin))
@@ -720,10 +689,12 @@ def on_vertical(proxy, etype, event):
             or CG.CGEventGetIntegerValueField(event, F_GESTURE_HID_TYPE) != HID_DOCK_SWIPE
             or CG.CGEventGetIntegerValueField(event, F_SWIPE_MOTION) != MOTION_VERTICAL):
         return _NOT_VERTICAL
-    TEMPLATES.capture(event, MOTION_VERTICAL)
     phase = CG.CGEventGetIntegerValueField(event, F_GESTURE_PHASE)
+    RECORDINGS.record(event, MOTION_VERTICAL, phase)
     if phase == PHASE_BEGAN:
         mc_replay_pending(proxy)
+        if not RECORDINGS.has(MOTION_VERTICAL):
+            return event  # still recording this kind of swipe: native
         state = overview_state()
         if state is None or not mc_hold(event):
             return event
@@ -753,10 +724,10 @@ def on_swipe(event):
         return event
     if CG.CGEventGetIntegerValueField(event, F_SWIPE_MOTION) != MOTION_HORIZONTAL:
         return event
-    TEMPLATES.capture(event, MOTION_HORIZONTAL)
     phase = CG.CGEventGetIntegerValueField(event, F_GESTURE_PHASE)
+    RECORDINGS.record(event, MOTION_HORIZONTAL, phase)
     if phase == PHASE_BEGAN:
-        if overview_up() or TEMPLATES.get(MOTION_HORIZONTAL) is None:
+        if overview_up() or not RECORDINGS.has(MOTION_HORIZONTAL):
             G.swipe_tracking = G.swipe_fired = False
             return event
         G.swipe_tracking, G.swipe_fired, G.swipe_since = True, False, time.monotonic()
@@ -768,8 +739,12 @@ def on_swipe(event):
             progress = CG.CGEventGetDoubleValueField(event, F_SWIPE_PROGRESS)
             if abs(progress) >= SWIPE_DIRECTION_THRESHOLD:
                 G.swipe_fired = True
-                did = switch(progress > 0)
-                log("swipe %s%s" % ("right" if progress > 0 else "left", "" if did else " (edge, ignored)"))
+                # macOS 27: positive progress = previous Space; trust the IOHID value the Dock reads
+                hp = hid_progress(event)
+                right = (hp if hp is not None else progress) < 0
+                did = switch(right)
+                log("swipe %s%s" % ("right" if right else "left", "" if did else " (edge, ignored)"))
+                trace("swipe cg_progress=%+.3f hid_progress=%s" % (progress, "%+.3f" % hp if hp is not None else None))
         return None
     if phase == PHASE_ENDED:
         if not G.swipe_tracking:
@@ -777,8 +752,8 @@ def on_swipe(event):
         if not G.swipe_fired:
             vel = CG.CGEventGetDoubleValueField(event, F_SWIPE_VEL_X)
             if vel != 0.0:
-                did = switch(vel > 0)
-                log("swipe %s on release%s" % ("right" if vel > 0 else "left", "" if did else " (edge, ignored)"))
+                did = switch(vel < 0)
+                log("swipe %s on release%s" % ("right" if vel < 0 else "left", "" if did else " (edge, ignored)"))
         G.swipe_tracking = G.swipe_fired = False
         return None
     if phase == PHASE_CANCELLED:
@@ -797,7 +772,7 @@ def on_event(proxy, etype, event, refcon):
     if etype in (CGS_EVENT_DOCK_CONTROL, CGS_EVENT_GESTURE):
         if is_synthetic(event):
             return event
-        if CFG["trackpad_vertical"]:
+        if CFG["trackpad_vertical"] and MC_SUPPORTED:
             result = on_vertical(proxy, etype, event)
             if result is not _NOT_VERTICAL:
                 return result
@@ -820,7 +795,7 @@ def on_event(proxy, etype, event, refcon):
     key = CG.CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
     flags = CG.CGEventGetFlags(event) & MODIFIER_MASK
     repeat = CG.CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)
-    if SHORTCUTS.is_mc(key, flags) or SHORTCUTS.is_expose(key, flags):
+    if MC_SUPPORTED and (SHORTCUTS.is_mc(key, flags) or SHORTCUTS.is_expose(key, flags)):
         if repeat:
             return None
         state = overview_state()
@@ -833,9 +808,9 @@ def on_event(proxy, etype, event, refcon):
             direction = 1
         else:
             return event
-        did = post_mc_transition_27(None, direction)
+        did = post_mc_transition(None, direction)
         if not did:
-            return event  # no cached vertical node yet; pass shortcut through natively
+            return event  # nothing recorded yet for this Dock: native
         G.mc_key_claimed = key == KEY_MISSION_CONTROL
         log("key mission control %s (%s)" % ("up" if direction > 0 else "down", state))
         return None
@@ -850,7 +825,7 @@ def on_event(proxy, etype, event, refcon):
     G.last_switch = now
     did = switch(right)
     if did is None:
-        return event  # no cached horizontal node yet; pass shortcut through natively
+        return event  # nothing recorded yet for this Dock: native
     log("key %s%s" % ("right" if right else "left", "" if did else " (edge, ignored)"))
     return None if did else event
 
@@ -864,13 +839,14 @@ def main():
     def tick():
         gestures_stale()
         SHORTCUTS.refresh()
-        TEMPLATES.check_pid()
+        RECORDINGS.check_pid()
 
     info = space_info()
     where = "display %s, space %d of %d" % (info[0][:8], info[1] + 1, info[2]) if info else "no CGS space info; edge clamping off"
+    recorded = ", ".join(RECORDINGS.name(m) for m in sorted(RECORDINGS.complete)) or "none yet: first swipe of each kind is native"
     daemon.run("spaceswitch", mask, on_event, on_tick=tick,
-               ready_msg="spaceswitch (macOS 27) ready: keyboard=%s swipe=%s/%s (%s; %s)" % (
-                   CFG["keyboard"], CFG["trackpad_horizontal"], CFG["trackpad_vertical"], where, CFG_PATH))
+               ready_msg="spaceswitch (macOS 27) ready: keyboard=%s swipe=%s/%s recorded=%s (%s; %s)" % (
+                   CFG["keyboard"], CFG["trackpad_horizontal"], CFG["trackpad_vertical"], recorded, where, CFG_PATH))
 
 
 if __name__ == "__main__":
