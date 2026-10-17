@@ -6,10 +6,10 @@ silently run with a half-parsed config.
 
 Hotkey strings look like "opt+left", "opt+shift+=", "ctrl+cmd+right". Modifier names:
 shift ctrl/control opt/option/alt cmd/command. Key names: left right up down tab esc
-return space minus/- equal/= plus/+ a-z 0-9 f1-f20 missioncontrol.
+return space minus/- equal/= plus/+ a-z 0-9 f1-f20.
 
-Two names resolve to whatever the user has bound in System Settings > Keyboard > Shortcuts
-> Mission Control at daemon start: "spaceleft" / "spaceright" (Move left/right a space).
+Three names resolve to whatever the user has bound in System Settings > Keyboard >
+Shortcuts > Mission Control at daemon start: "missioncontrol", "spaceleft", "spaceright".
 """
 
 import json
@@ -31,12 +31,16 @@ KEYCODES = {
     "f20": 90, "f5": 96, "f6": 97, "f7": 98, "f3": 99, "f8": 100, "f9": 101, "f11": 103,
     "f13": 105, "f16": 106, "f14": 107, "f10": 109, "f12": 111, "f15": 113, "home": 115,
     "pageup": 116, "f4": 118, "end": 119, "f2": 120, "pagedown": 121, "f1": 122, "left": 123,
-    "right": 124, "down": 125, "up": 126, "missioncontrol": 160, "padplus": 69, "padminus": 78,
+    "right": 124, "down": 125, "up": 126, "padplus": 69, "padminus": 78,
 }
 
 
 # com.apple.symbolichotkeys ids -> macOS default binding
-SYMBOLIC_HOTKEYS = {"spaceleft": (79, "ctrl+left"), "spaceright": (81, "ctrl+right")}
+SYMBOLIC_HOTKEYS = {
+    "missioncontrol": (32, "ctrl+up"),
+    "spaceleft": (79, "ctrl+left"),
+    "spaceright": (81, "ctrl+right"),
+}
 SYMBOLIC_HOTKEYS_PATH = os.path.expanduser("~/Library/Preferences/com.apple.symbolichotkeys.plist")
 
 
@@ -69,7 +73,7 @@ def parse_hotkey(spec):
     """'opt+shift+=' -> (keycode, flags). Raises ConfigError on unknown names.
 
     The key itself may be '+' or '-': write it last, e.g. 'opt+shift++' / 'opt+-'.
-    'spaceleft' / 'spaceright' return the system Spaces binding (None if disabled there).
+    'missioncontrol' / 'spaceleft' / 'spaceright' return the system shortcut (None if disabled).
     """
     if not isinstance(spec, str) or not spec.strip():
         raise ConfigError(f"hotkey must be a non-empty string, got {spec!r}")

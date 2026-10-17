@@ -296,8 +296,7 @@ def post_key(keycode, flags=0, source=None):
         ev = CG.CGEventCreateKeyboardEvent(source, keycode, down)
         if not ev:
             return False
-        if flags:
-            CG.CGEventSetFlags(ev, flags)
+        CG.CGEventSetFlags(ev, flags)
         CG.CGEventPost(kCGSessionEventTap, ev)
         CF.CFRelease(ev)
     return True

@@ -25,8 +25,9 @@ pairs well with `spaceswitch`), main wheel untouched.
 ```
 
 Any hotkey may be `""` to leave that control alone (the mouse's default behaviour
-returns). `spaceleft` / `spaceright` are resolved from the system shortcuts when the daemon
-starts (restart after changing them); any other hotkey string works too, e.g. `"ctrl+left"`.
+returns). `missioncontrol`, `spaceleft`, and `spaceright` are resolved from the system
+shortcuts when the daemon starts (restart after changing them); any other hotkey string
+works too, e.g. `"ctrl+left"`.
 If the thumb wheel moves the wrong way, swap the two strings. `invert_main_wheel` flips
 only mouse scrolling — trackpad direction is unchanged, which the system "natural
 scrolling" checkbox cannot do. The config file is not created for you; the `ready:` log

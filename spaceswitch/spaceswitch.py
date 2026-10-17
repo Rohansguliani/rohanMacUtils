@@ -270,7 +270,7 @@ def overview_state():
     CF.CFRelease(spaces)
     mc, expose = "mission-control" in names, "show-front" in names
     if mc == expose:
-        return None
+        return None if (mc or "show-desktop" in names) else "desktop"
     return "mission-control" if mc else "app-expose"
 
 
