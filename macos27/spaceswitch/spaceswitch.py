@@ -25,8 +25,8 @@ import json
 import os
 import plistlib
 import struct
-import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "util"))
@@ -78,6 +78,7 @@ KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_MISSION_CONTROL = 123, 124, 126, 125,
 # --- tuning (all measured on macOS 26; see docstrings) -----------------------------------
 INSTANT_VELOCITY = 2000.0            # anything well above the Dock's flick threshold
 EPSILON_PROGRESS = 1e-4              # Began progress; FLT_TRUE_MIN flushes to zero on Apple Silicon
+SHORT_TRAVEL = 0.1                   # Changed/Ended progress of a forged switch (see switch())
 SWIPE_DIRECTION_THRESHOLD = 0.05     # |progress| before a real swipe's direction is trusted
 MIN_SWITCH_GAP = 0.08                # s between two forged switches (WindowServer re-layering)
 MC_EPSILON = 1.0 / 65536.0           # smallest signed 16.16 step
@@ -178,24 +179,15 @@ def patch_payload(tmpl, progress, vx, vy):
     return bytes(b)
 
 
-def dock_pid():
-    try:
-        return int(subprocess.check_output(["pgrep", "-x", "Dock"], text=True).split()[0])
-    except (subprocess.CalledProcessError, ValueError, IndexError, OSError):
-        return 0
-
-
 class Recordings:
     """Real Began / Changed / Ended payloads per motion, from the first complete swipe seen.
 
-    Keyed by Dock pid: the vendor stream may reference per-Dock-instance gesture ids, so a
-    Dock restart invalidates everything. Nothing here forks on the event path; the pid is
-    re-checked from the 5 s tick.
+    The payloads are plain trackpad IOHID DockSwipe records (sender = the trackpad's registry
+    id, nothing Dock-specific), so they stay valid across Dock restarts and are cached on disk.
     """
     PHASES = (PHASE_BEGAN, PHASE_CHANGED, PHASE_ENDED)
 
     def __init__(self):
-        self.pid = dock_pid()
         self.payloads: dict[tuple[int, int], bytes] = {}
         self.complete: set[int] = set()
         self.load()
@@ -206,9 +198,6 @@ class Recordings:
         try:
             with open(CACHE_PATH, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
-            if d.get("dock_pid") != self.pid:
-                log("gesture cache is for Dock pid %s (now %d); re-recording" % (d.get("dock_pid"), self.pid))
-                return
             for key, raw_hex in d["payloads"].items():
                 motion, phase = (int(x) for x in key.split(":"))
                 self.payloads[(motion, phase)] = bytes.fromhex(raw_hex)
@@ -221,8 +210,7 @@ class Recordings:
         try:
             os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
             with open(CACHE_PATH, "w", encoding="utf-8") as fh:
-                json.dump({"dock_pid": self.pid,
-                           "payloads": {"%d:%d" % k: v.hex() for k, v in self.payloads.items()}}, fh)
+                json.dump({"payloads": {"%d:%d" % k: v.hex() for k, v in self.payloads.items()}}, fh)
         except OSError as e:
             log(f"gesture cache not saved: {e}")
 
@@ -232,20 +220,6 @@ class Recordings:
 
     def has(self, motion):
         return all((motion, p) in self.payloads for p in self.PHASES)
-
-    def check_pid(self):
-        if self.pid:
-            try:
-                os.kill(self.pid, 0)  # still alive: nothing to do, no fork
-                return
-            except OSError:
-                pass
-        cur = dock_pid()
-        if cur and cur != self.pid:
-            log(f"Dock restarted ({self.pid} -> {cur}); recorded gestures discarded")
-            self.pid = cur
-            self.payloads.clear()
-            self.complete.clear()
 
     def record(self, event, motion, phase):
         """Began restarts the recording; Changed keeps the latest frame; Ended completes it."""
@@ -553,11 +527,13 @@ def switch(right):
     """One Space in the given direction. False at the edge (nothing posted), None if we have
     no recording yet for this Dock (caller lets the native switch happen).
 
-    macOS 27 recipe (measured with sstest.py, 36 ms to commit, exactly one Space): a flick,
-    Began(~0) -> Ended(~0) at terminal velocity. Any Changed/Ended with progress 1.0 commits
-    a Space on its own and the velocity then projects further ones ("jumps around"), and
-    velocities in the real events' range (~1-5) give the stock 500 ms animation. Positive
-    progress moves to the previous Space (the opposite of the macOS 26 CGEvent field)."""
+    macOS 27 recipe (sstest2.py, 12/12 clean one-Space commits in 31-53 ms):
+    Began(~0) -> Changed(0.1) -> Ended(0.1, terminal velocity), back to back. The short
+    travel matters: a zero-travel flick (Began -> Ended) is a race and gives no-ops, bounces
+    and double steps about a third of the time. Progress 1.0 anywhere makes the Dock commit
+    on its own and the velocity then projects further Spaces, and velocities in the real
+    events' range (~1-5) give the stock 500 ms animation. Positive progress moves to the
+    previous Space (the opposite of the macOS 26 CGEvent field)."""
     global _last_switch_done
     if not RECORDINGS.has(MOTION_HORIZONTAL):
         return None
@@ -573,12 +549,28 @@ def switch(right):
     if gap > 0:
         time.sleep(gap)
     if not post_sequence(None, MOTION_HORIZONTAL, -1 if right else 1,
-                         [(PHASE_BEGAN, EPSILON_PROGRESS, INSTANT_VELOCITY), (PHASE_ENDED, EPSILON_PROGRESS, INSTANT_VELOCITY)]):
+                         [(PHASE_BEGAN, EPSILON_PROGRESS, 0.0), (PHASE_CHANGED, SHORT_TRAVEL, 0.0),
+                          (PHASE_ENDED, SHORT_TRAVEL, INSTANT_VELOCITY)]):
         return False
     _last_switch_done = time.monotonic()
     if info:
         _predicted[info[0]] = (target, _last_switch_done)
+    if TRACE:
+        threading.Thread(target=_trace_landing, args=(info[1] if info else None, _last_switch_done), daemon=True).start()
     return True
+
+
+def _trace_landing(start_index, t0):
+    """debug: log how the CGS space index moves during the second after a forged switch."""
+    trail, last = [], start_index
+    while time.monotonic() - t0 < 1.2:
+        info = space_info()
+        cur = info[1] if info else None
+        if cur != last:
+            trail.append("%d@%dms" % (cur, (time.monotonic() - t0) * 1000))
+            last = cur
+        time.sleep(0.005)
+    log("landing: from %s -> %s" % (start_index, " -> ".join(trail) or "no change"))
 
 
 # No forged vertical recipe works on macOS 27 yet (sstest/mctest: 2- and 3-event sequences at
@@ -839,7 +831,6 @@ def main():
     def tick():
         gestures_stale()
         SHORTCUTS.refresh()
-        RECORDINGS.check_pid()
 
     info = space_info()
     where = "display %s, space %d of %d" % (info[0][:8], info[1] + 1, info[2]) if info else "no CGS space info; edge clamping off"
