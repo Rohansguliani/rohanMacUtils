@@ -185,6 +185,13 @@ _sig(CG, "CGRectMakeWithDictionaryRepresentation", cbool, [vp, C.POINTER(CGRect)
 
 FLAG_SHIFT, FLAG_CTRL, FLAG_OPT, FLAG_CMD = 0x20000, 0x40000, 0x80000, 0x100000
 MODIFIER_MASK = FLAG_SHIFT | FLAG_CTRL | FLAG_OPT | FLAG_CMD
+# NX_SECONDARYFNMASK: a real keyboard sets it on arrows, nav keys and F-keys, and the
+# system shortcuts are recorded with it ("⌘↑" is 0x900000 in com.apple.symbolichotkeys).
+# macOS 27 only matches a posted keystroke against those shortcuts when the bit is present
+# (measured: ⌘↑ with 0x100000 is ignored, 0x900000 toggles Mission Control).
+FLAG_FN = 0x800000
+FN_KEYCODES = frozenset([123, 124, 125, 126, 115, 116, 117, 119, 121,
+                         122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90])
 FLAG_NAMES = {"shift": FLAG_SHIFT, "ctrl": FLAG_CTRL, "control": FLAG_CTRL, "opt": FLAG_OPT,
               "option": FLAG_OPT, "alt": FLAG_OPT, "cmd": FLAG_CMD, "command": FLAG_CMD}
 
@@ -291,7 +298,10 @@ def log(msg):
 
 def post_key(keycode, flags=0, source=None):
     """Post a key down+up pair as if typed (used by packages that want to drive the system
-    without depending on another package being installed)."""
+    without depending on another package being installed). Function-row/arrow keys get the
+    fn flag a physical keyboard would set, so system shortcuts (Mission Control) match."""
+    if keycode in FN_KEYCODES:
+        flags |= FLAG_FN
     for down in (True, False):
         ev = CG.CGEventCreateKeyboardEvent(source, keycode, down)
         if not ev:
